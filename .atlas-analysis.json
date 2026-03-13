@@ -1,0 +1,102 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "Kamakiri",
+  "projectDescription": "A bootrom exploit tool for MediaTek devices enabling device unlock and custom firmware installation",
+  "theme": "aspen",
+  "primaryColor": "#E63946",
+  "lightColor": "#F1FAEE",
+  "darkColor": "#1D3557",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "prerequisites",
+              "installation"
+            ]
+          },
+          {
+            "group": "Usage",
+            "pages": [
+              "usage/quickstart",
+              "usage/bootrom-exploit",
+              "usage/boot-modes",
+              "usage/gpt-operations"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/payload-system",
+              "architecture/device-communication"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/troubleshooting",
+              "advanced/building-payloads",
+              "advanced/safety-warnings"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Command Reference",
+            "pages": [
+              "reference/bootrom-step",
+              "reference/boot-fastboot",
+              "reference/boot-recovery",
+              "reference/gpt-fix"
+            ]
+          },
+          {
+            "group": "Python API",
+            "pages": [
+              "reference/device-class",
+              "reference/payload-loading",
+              "reference/functions"
+            ]
+          },
+          {
+            "group": "Payloads",
+            "pages": [
+              "reference/stage1-payload",
+              "reference/stage2-payload",
+              "reference/lk-payload",
+              "reference/microloader"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-stage bootrom exploit execution",
+    "eMMC partition manipulation and GPT management",
+    "RPMB downgrade for firmware rollback",
+    "Fastboot and recovery mode forcing",
+    "Device unlock and verification bypass",
+    "Serial communication protocol for MediaTek devices"
+  ],
+  "publicApiSurface": [
+    "bootrom-step.sh - Main exploit execution script",
+    "boot-fastboot.sh - Force boot into fastboot mode",
+    "boot-recovery.sh - Force boot into recovery mode",
+    "gpt-fix.sh - Fix corrupted GPT partition table",
+    "Device class - Python interface for device communication",
+    "load_payload() - Load and execute bootrom payloads",
+    "load_pl_payload() - Load preloader payload",
+    "emmc_read()/emmc_write() - Direct eMMC access",
+    "rpmb_read()/rpmb_write() - RPMB partition operations",
+    "parse_gpt() - GPT partition table parser"
+  ]
+}
