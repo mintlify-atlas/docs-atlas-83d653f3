@@ -1,0 +1,149 @@
+---
+title: Prerequisites
+description: System requirements and preparation steps before using Kamakiri
+---
+
+## Supported Devices
+
+Kamakiri currently supports the following Amazon Fire HD 8 tablet variants:
+
+- **Mantis** (device_type_id: `AKPGW064GI9HE`)
+- **Karnak**
+
+These devices use MediaTek MT8163 SoC and are vulnerable to the bootrom exploit that Kamakiri leverages.
+
+<Warning>
+This exploit involves low-level hardware access and modifies critical device partitions including the bootloader, TrustZone, and RPMB. **There is a risk of permanent device damage or bricking.** Proceed only if you understand the risks and accept full responsibility.
+</Warning>
+
+## Operating System Requirements
+
+### Linux-Based System
+
+Kamakiri requires a Linux-based operating system (native Linux or WSL2 on Windows). The tool interacts directly with USB serial devices and requires specific system-level access.
+
+### ModemManager Must Be Disabled
+
+<Warning>
+**Critical:** ModemManager must be disabled or uninstalled before running Kamakiri. ModemManager interferes with the serial communication required for the exploit.
+</Warning>
+
+Kamakiri automatically checks for ModemManager at runtime (see `modules/functions.py:24-34`) and will refuse to proceed if it's running.
+
+To disable ModemManager:
+
+<CodeGroup>
+```bash Ubuntu/Debian
+sudo systemctl stop ModemManager
+sudo systemctl disable ModemManager
+```
+
+```bash Fedora/RHEL
+sudo systemctl stop ModemManager
+sudo systemctl disable ModemManager
+```
+
+```bash Arch Linux
+sudo systemctl stop ModemManager
+sudo systemctl disable ModemManager
+```
+</CodeGroup>
+
+To verify ModemManager is stopped:
+
+```bash
+systemctl status ModemManager
+```
+
+## Hardware Requirements
+
+### USB Connection
+
+- **USB cable** capable of data transfer (not charge-only)
+- Direct USB connection to your computer (avoid USB hubs if possible for reliability)
+- USB port with proper power delivery
+
+### Physical Device Access
+
+You'll need physical access to the tablet to:
+- Power on/off the device
+- Put the device into specific boot modes
+- Potentially create hardware shorts (for certain recovery scenarios)
+
+## Software Dependencies
+
+### Python 3
+
+Kamakiri requires Python 3.x. Install Python 3 and pip:
+
+```bash
+sudo apt update
+sudo apt install python3 python3-pip
+```
+
+### Python Libraries
+
+The following Python packages are required (from `requirements.txt`):
+
+- **future** (0.17.1) - Compatibility layer for Python 2/3
+- **iso8601** (0.1.12) - Date/time parsing
+- **pyserial** (3.4) - Serial port communication
+- **pyusb** (1.0.2) - USB device access
+- **PyYAML** (5.1.2) - YAML parsing
+
+These will be installed during the [installation process](/installation).
+
+### Build Tools for ARM Cross-Compilation
+
+Kamakiri includes C payloads that must be compiled for ARM architecture:
+
+```bash
+sudo apt install gcc-arm-none-eabi binutils-arm-none-eabi
+```
+
+Required tools:
+- `arm-none-eabi-gcc` - ARM GCC compiler
+- `arm-none-eabi-as` - ARM assembler  
+- `arm-none-eabi-ld` - ARM linker
+- `arm-none-eabi-objcopy` - Object file converter
+- `make` - Build automation
+
+<Note>
+The Makefiles are configured for Cortex-A9 CPU (`-mcpu=cortex-a9`) which matches the MT8163 SoC in the target devices.
+</Note>
+
+### Additional Build Dependencies
+
+```bash
+sudo apt install build-essential
+```
+
+## Understanding the Risk
+
+<Warning>
+**Read this carefully before proceeding:**
+
+1. **RPMB Modification**: The exploit zeros out the RPMB (Replay Protected Memory Block) to enable downgrading. This is a one-way operation that affects secure boot verification.
+
+2. **Bootloader Replacement**: Kamakiri replaces the preloader, TrustZone (tz.img), and LK (little kernel) with modified versions.
+
+3. **No Warranty**: Using this tool voids any warranty and Amazon will not support modified devices.
+
+4. **Brick Risk**: Improper execution, power loss during flashing, or hardware issues can result in a bricked device.
+
+5. **Legal Considerations**: Ensure you own the device and understand the legal implications of modifying it in your jurisdiction.
+</Warning>
+
+## User Interaction Requirements
+
+During the exploit process, you may be prompted for user input:
+
+- **RPMB verification**: If the RPMB appears corrupted (e.g., from a previous exploit attempt), you'll need to confirm whether to proceed
+- **Hardware shorts removal**: You may be instructed to remove any physical shorts applied to the device
+- **Device timing**: You must be ready to connect the device at specific moments
+
+See `modules/functions.py:10-22` for the interactive prompts implementation.
+
+## Next Steps
+
+Once you've verified all prerequisites are met, proceed to the [Installation](/installation) guide to set up Kamakiri.

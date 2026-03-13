@@ -1,0 +1,264 @@
+---
+title: 'Quickstart Guide'
+description: 'Get started with Kamakiri - from device connection to successful exploit'
+icon: 'rocket'
+---
+
+This guide walks you through running your first bootrom exploit with Kamakiri on a MediaTek device.
+
+## Prerequisites
+
+Before you begin, ensure you have:
+
+- A compatible MediaTek device (e.g., Amazon Fire HD 8 - mantis)
+- USB cable for device connection
+- Linux system with Python 3 installed
+- Required Python dependencies installed (`pip install -r requirements.txt`)
+- ModemManager disabled or uninstalled
+
+<Warning>
+  ModemManager must be disabled before running Kamakiri. The tool will check for this and exit if detected.
+</Warning>
+
+## Step-by-Step Exploit Process
+
+<Steps>
+  <Step title="Prepare Your Device">
+    Power off your MediaTek device completely. You'll need to boot it into bootrom mode for the exploit to work.
+    
+    For most devices, this means:
+    - Power off the device
+    - Remove any short/test point connections
+    - Have the USB cable ready
+  </Step>
+
+  <Step title="Run the Bootrom Exploit">
+    Execute the bootrom exploit script:
+    
+    ```bash
+    ./bootrom-step.sh
+    ```
+    
+    The script will wait for your device to connect.
+    
+    <Note>
+      If your device is in preloader mode instead of bootrom mode, you can use the `crash` argument to automatically crash the preloader and drop into bootrom mode.
+    </Note>
+  </Step>
+
+  <Step title="Connect Your Device">
+    When you see "Waiting for device", connect your device via USB while holding the appropriate button combination to enter bootrom mode.
+    
+    Expected output:
+    ```
+    [2024-03-13 10:15:32] Waiting for device
+    [2024-03-13 10:15:35] Found port = /dev/ttyUSB0
+    [2024-03-13 10:15:35] Handshake
+    ```
+  </Step>
+
+  <Step title="Remove Test Point (If Applicable)">
+    When prompted, remove any shorting/test point connection:
+    
+    ```
+    * * * If you have a short attached, remove it now * * *
+    * * * Press Enter to continue * * *
+    ```
+    
+    Press Enter to continue after removing the short.
+  </Step>
+
+  <Step title="Wait for Exploit Stages">
+    The exploit will proceed through multiple stages:
+    
+    1. **Stage 1 Payload Load**: Exploits bootrom vulnerability
+    2. **Stage 2 Payload Load**: Provides full eMMC access
+    3. **Device Verification**: Checks device_type_id
+    4. **GPT Validation**: Ensures partition table is intact
+    5. **RPMB Downgrade**: Zeros out RPMB for anti-rollback bypass
+    6. **Component Flashing**: Installs TZ, LK, microloader, and preloader
+    
+    Expected output:
+    ```
+    [2024-03-13 10:15:40] All good
+    [2024-03-13 10:15:40] Load 2nd stage payload
+    [2024-03-13 10:15:40] Send 2nd stage payload
+    [2024-03-13 10:15:41] Party time
+    [2024-03-13 10:15:41] All good
+    [2024-03-13 10:15:41] Check device_type_id
+    [2024-03-13 10:15:41] Detected mantis (AKPGW064GI9HE)
+    [2024-03-13 10:15:42] Check GPT
+    [2024-03-13 10:15:42] gpt_parsed = {'lk': (123456, 1024), 'tee1': (124480, 512), ...}
+    ```
+  </Step>
+
+  <Step title="RPMB Warning (First Run)">
+    On first run, the RPMB check will pass. On subsequent runs, you'll see:
+    
+    ```
+    rpmb looks broken; if this is expected (i.e. you're retrying the exploit) 
+    press enter, otherwise terminate with Ctrl+C
+    ```
+    
+    This is normal for repeat runs. Press Enter to continue.
+  </Step>
+
+  <Step title="Component Installation">
+    The exploit will flash several components:
+    
+    - **TZ (TrustZone)**: Downgraded version for exploit compatibility
+    - **LK (Little Kernel)**: Bootloader with vulnerabilities
+    - **LK Payload**: Custom payload for persistent access
+    - **Microloader**: Boot hijack component
+    - **Preloader**: Modified preloader (if needed)
+    
+    Progress indicators will show:
+    ```
+    [2024-03-13 10:15:45] Flash tz
+    [50 / 100]
+    [2024-03-13 10:15:48] Flash lk
+    [200 / 512]
+    ```
+  </Step>
+
+  <Step title="Device Reboot">
+    After all components are flashed, the device will reboot:
+    
+    ```
+    [2024-03-13 10:16:10] Force fastboot
+    [2024-03-13 10:16:11] Reboot
+    ```
+    
+    The device should boot into fastboot mode automatically.
+  </Step>
+
+  <Step title="Verify Success">
+    Check that your device boots into fastboot mode. You should see the fastboot screen or be able to connect with:
+    
+    ```bash
+    adb devices
+    # or
+    fastboot devices
+    ```
+    
+    If successful, you now have persistent bootrom access!
+  </Step>
+</Steps>
+
+## Troubleshooting First Run
+
+### Device Not Detected
+
+**Problem**: "Waiting for device" never progresses
+
+**Solutions**:
+- Check USB cable connection
+- Verify device is in bootrom mode (correct button combination)
+- Try a different USB port (USB 2.0 preferred)
+- Check dmesg for device enumeration: `dmesg | tail`
+
+### ModemManager Conflict
+
+**Problem**: "You need to temporarily disable/uninstall ModemManager"
+
+**Solutions**:
+```bash
+# Temporary disable
+sudo systemctl stop ModemManager
+
+# Permanent disable
+sudo systemctl disable ModemManager
+
+# Or uninstall
+sudo apt remove modemmanager
+```
+
+### Wrong Device Detected
+
+**Problem**: "Wrong device detected: [device_id]"
+
+**Solutions**:
+- Verify you have the correct device (currently mantis/Fire HD 8 only)
+- Check device_type_id in modules/main.py
+- Contact maintainers if you have a different device
+
+### GPT Corruption
+
+**Problem**: "bad gpt" error
+
+**Solutions**:
+```bash
+# Fix GPT with backup
+./gpt-fix.sh
+
+# Or using bootrom-step directly
+./bootrom-step.sh fixgpt
+```
+
+See [GPT Operations](/usage/gpt-operations) for details.
+
+### RPMB Downgrade Failure
+
+**Problem**: "downgrade failure, giving up"
+
+**Solutions**:
+- Device will automatically reboot
+- Wait 30 seconds and retry the exploit
+- RPMB write may need multiple attempts
+- Ensure stable USB connection
+
+### Stage 1/2 Payload Errors
+
+**Problem**: "received [bytes] instead of expected pattern"
+
+**Solutions**:
+- USB connection issue - try different cable/port
+- Timing problem - retry the exploit
+- Payload corruption - verify brom-payload directory is intact
+- Check that payload binaries exist:
+  ```bash
+  ls -l brom-payload/stage1/stage1.bin
+  ls -l brom-payload/stage2/stage2.bin
+  ```
+
+### Device Stuck After Exploit
+
+**Problem**: Device doesn't boot or stuck at logo
+
+**Solutions**:
+- Re-run exploit with fixgpt option
+- Boot to recovery mode manually
+- Flash stock firmware via preloader mode
+- Check that all binaries in `bin/` directory are correct
+
+## Next Steps
+
+After successful exploit:
+
+<CardGroup cols={2}>
+  <Card title="Boot Modes" icon="power-off" href="/usage/boot-modes">
+    Learn how to boot into fastboot or recovery mode
+  </Card>
+  <Card title="GPT Operations" icon="hard-drive" href="/usage/gpt-operations">
+    Understand partition structure and GPT management
+  </Card>
+  <Card title="Bootrom Exploit Details" icon="shield-halved" href="/usage/bootrom-exploit">
+    Deep dive into the exploit mechanism
+  </Card>
+</CardGroup>
+
+## Safety Notes
+
+<Warning>
+  **Important Safety Information**
+  
+  - Always ensure stable power during the exploit (>50% battery)
+  - Do not disconnect USB during flashing operations
+  - Keep backups of your GPT and important partitions
+  - The RPMB downgrade is permanent and disables verified boot
+  - This exploit modifies boot0, user, and RPMB partitions
+</Warning>
+
+<Note>
+  The exploit is designed to be re-runnable. If something goes wrong, you can usually recover by running the exploit again.
+</Note>

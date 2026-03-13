@@ -1,0 +1,563 @@
+---
+title: Building Payloads
+description: Guide to building custom payloads from source
+icon: hammer
+---
+
+This guide covers building the Kamakiri payloads from source, including compiler requirements, build process, and customization.
+
+## Overview
+
+Kamakiri uses three separate payload stages:
+
+1. **brom-payload** - Initial bootrom exploit payloads (stage1, stage2, pl)
+2. **lk-payload** - LittleKernel bootloader payload
+3. **microloader** - Boot-time injection payload
+
+Each payload is built separately with specific memory constraints and toolchain requirements.
+
+## Toolchain Requirements
+
+<Steps>
+  <Step title="Install ARM Cross-Compiler">
+    All payloads require the ARM embedded toolchain:
+
+    **Ubuntu/Debian:**
+    ```bash
+    sudo apt update
+    sudo apt install gcc-arm-none-eabi binutils-arm-none-eabi
+    ```
+
+    **Fedora/RHEL:**
+    ```bash
+    sudo dnf install arm-none-eabi-gcc arm-none-eabi-newlib
+    ```
+
+    **macOS:**
+    ```bash
+    brew install --cask gcc-arm-embedded
+    ```
+
+    **Arch Linux:**
+    ```bash
+    sudo pacman -S arm-none-eabi-gcc arm-none-eabi-newlib
+    ```
+
+    Verify installation:
+    ```bash
+    arm-none-eabi-gcc --version
+    ```
+
+    Expected output:
+    ```
+    arm-none-eabi-gcc (GNU Arm Embedded Toolchain) 10.3.1
+    ```
+  </Step>
+
+  <Step title="Install Build Dependencies">
+    Additional tools required:
+
+    ```bash
+    sudo apt install make binutils
+    ```
+
+    For Python components:
+    ```bash
+    pip3 install pyserial pyusb
+    ```
+  </Step>
+
+  <Step title="Verify Toolchain">
+    Check all required tools are available:
+
+    ```bash
+    which arm-none-eabi-gcc
+    which arm-none-eabi-as
+    which arm-none-eabi-objcopy
+    which make
+    ```
+  </Step>
+</Steps>
+
+## Building brom-payload
+
+### Makefile Structure
+
+The brom-payload Makefile (`brom-payload/Makefile`) defines three build targets:
+
+```makefile
+CC := arm-none-eabi-gcc
+AS := arm-none-eabi-as
+LD := arm-none-eabi-gcc
+OBJCOPY := arm-none-eabi-objcopy
+
+CFLAGS := -std=gnu99 -Os -mthumb -mcpu=cortex-a9 \
+          -fno-builtin-printf -fno-strict-aliasing \
+          -fno-builtin-memcpy -mno-unaligned-access \
+          -Wall -Wextra
+
+LDFLAGS := -nodefaultlibs -nostdlib -lgcc
+```
+
+### Compiler Flags Explained
+
+<CardGroup cols={2}>
+  <Card title="-Os" icon="gauge-high">
+    Optimize for size - critical due to strict payload size limits
+  </Card>
+  <Card title="-mthumb" icon="microchip">
+    Use Thumb instruction set for smaller code size
+  </Card>
+  <Card title="-mcpu=cortex-a9" icon="cpu">
+    Target MediaTek MT8163 Cortex-A9 processor
+  </Card>
+  <Card title="-fno-builtin" icon="ban">
+    Disable built-in functions to reduce dependencies
+  </Card>
+  <Card title="-mno-unaligned-access" icon="align-left">
+    Prevent unaligned memory access on ARM
+  </Card>
+  <Card title="-nodefaultlibs" icon="layer-group">
+    Don't link standard libraries (bare metal)
+  </Card>
+</CardGroup>
+
+### Build Process
+
+<Steps>
+  <Step title="Navigate to Payload Directory">
+    ```bash
+    cd brom-payload
+    ```
+  </Step>
+
+  <Step title="Clean Previous Build">
+    ```bash
+    make clean
+    ```
+
+    This removes:
+    - `stage1/` directory
+    - `stage2/` directory  
+    - `pl/` directory
+    - All compiled objects and binaries
+  </Step>
+
+  <Step title="Build All Payloads">
+    ```bash
+    make
+    ```
+
+    Or build individual targets:
+    ```bash
+    make stage1/stage1.bin
+    make stage2/stage2.bin
+    make pl/pl.bin
+    ```
+  </Step>
+
+  <Step title="Verify Build Output">
+    Check generated binaries:
+    ```bash
+    ls -lh stage1/stage1.bin stage2/stage2.bin pl/pl.bin
+    ```
+
+    Expected sizes:
+    - `stage1.bin`: < 2.5 KB (must be < 0xA00 = 2560 bytes)
+    - `stage2.bin`: varies (loaded to 0x201000)
+    - `pl.bin`: varies (loaded to 0x40001000)
+  </Step>
+</Steps>
+
+### Linker Scripts
+
+Each payload stage has a specific memory layout defined by linker scripts:
+
+#### Stage 1 Linker Script (`stage1.ld`)
+
+```ld
+OUTPUT_FORMAT("elf32-littlearm", "elf32-bigarm", "elf32-littlearm")
+OUTPUT_ARCH(arm)
+
+ENTRY(start)
+
+SECTIONS
+{
+  . = 0x100a00;
+
+  .text     : { *(.text.start) *(.text   .text.*   .gnu.linkonce.t.*) }
+  .rodata   : { *(.rodata .rodata.* .gnu.linkonce.r.*) }
+  .data     : { *(.data   .data.*   .gnu.linkonce.d.*) }
+  .bss      : { *(.bss    .bss.*    .gnu.linkonce.b.*) *(COMMON) }
+  /DISCARD/ : { *(.interp) *(.dynsym) *(.dynstr) *(.hash) *(.dynamic) *(.comment) }
+}
+```
+
+**Key points:**
+- Load address: `0x100a00` (bootrom scratch space)
+- Entry point: `start` symbol
+- Sections discarded to minimize size
+
+#### Stage 2 Linker Script (`stage2.ld`)
+
+```ld
+OUTPUT_FORMAT("elf32-littlearm", "elf32-bigarm", "elf32-littlearm")
+OUTPUT_ARCH(arm)
+
+ENTRY(start)
+
+SECTIONS
+{
+  . = 0x201000;
+
+  .text     : { *(.text.start) *(.text   .text.*   .gnu.linkonce.t.*) }
+  .rodata   : { *(.rodata .rodata.* .gnu.linkonce.r.*) }
+  .data     : { *(.data   .data.*   .gnu.linkonce.d.*) }
+  .bss      : { *(.bss    .bss.*    .gnu.linkonce.b.*) *(COMMON) }
+  /DISCARD/ : { *(.interp) *(.dynsym) *(.dynstr) *(.hash) *(.dynamic) *(.comment) }
+}
+```
+
+**Key points:**
+- Load address: `0x201000` (DRAM)
+- Larger payload with full eMMC/RPMB functionality
+- Same section layout as stage1
+
+<Warning>
+**Critical Size Constraint for Stage 1**
+
+Stage 1 payload MUST be less than 0xA00 (2560) bytes. This is enforced in `modules/load_payload.py:36`:
+
+```python
+if len(payload) >= 0xA00:
+    raise RuntimeError("payload too large")
+```
+
+If your modified payload exceeds this:
+- Remove debug strings
+- Disable unused features
+- Use more aggressive optimization (`-Os` → `-Oz` if available)
+- Review disassembly for bloat
+</Warning>
+
+## Building lk-payload
+
+### Makefile Configuration
+
+From `lk-payload/Makefile`:
+
+```makefile
+CC := arm-none-eabi-gcc
+AS := arm-none-eabi-as
+LD := arm-none-eabi-gcc
+OBJCOPY := arm-none-eabi-objcopy
+
+CFLAGS := -std=gnu99 -Os -mthumb -mcpu=cortex-a9 \
+          -fno-builtin-printf -fno-strict-aliasing \
+          -fno-builtin-memcpy -mno-unaligned-access \
+          -DPRINTF_DISABLE_SUPPORT_FLOAT=1
+
+LDFLAGS := -T linker.x -nodefaultlibs -nostdlib
+
+BUILD_DIR := ./build
+TARGET := payload
+```
+
+### Build Steps
+
+<Steps>
+  <Step title="Navigate to Directory">
+    ```bash
+    cd lk-payload
+    ```
+  </Step>
+
+  <Step title="Clean and Build">
+    ```bash
+    make clean
+    make
+    ```
+
+    Output: `build/payload.bin`
+  </Step>
+
+  <Step title="Verify Size">
+    LK payload is written to boot0 at offset 1024:
+    ```bash
+    ls -lh build/payload.bin
+    ```
+
+    The Makefile adds padding:
+    ```makefile
+    $(BUILD_DIR)/$(TARGET).bin: $(BUILD_DIR)/$(TARGET).elf
+        $(OBJCOPY) -O binary $^ $@
+        dd if=/dev/zero bs=512 count=1 >>$@ 2>/dev/null
+    ```
+  </Step>
+</Steps>
+
+## Building microloader
+
+### Makefile
+
+From `microloader/Makefile`:
+
+```makefile
+CC := arm-none-eabi-gcc
+AS := arm-none-eabi-as
+LD := arm-none-eabi-gcc
+OBJCOPY := arm-none-eabi-objcopy
+
+CFLAGS := -std=gnu99 -Os -mthumb -mcpu=cortex-a9 \
+          -fno-builtin-printf -fno-strict-aliasing \
+          -fno-builtin-memcpy -mno-unaligned-access \
+          -DPRINTF_DISABLE_SUPPORT_FLOAT=1
+
+LDFLAGS := -T linker.x -nodefaultlibs -nostdlib
+
+BUILD_DIR := ./build
+TARGET := payload
+```
+
+### Build Process
+
+```bash
+cd microloader
+make clean && make
+```
+
+Output: `build/payload.bin`
+
+<Note>
+Microloader is injected into the boot partition at runtime. The binary must fit within the boot header space (< 1024 bytes).
+</Note>
+
+## Testing Custom Payloads
+
+<Warning>
+**Before Testing Modified Payloads**
+
+1. Backup all original binaries
+2. Test in a VM or isolated environment first
+3. Have recovery method ready (JTAG, etc.)
+4. Verify binary sizes before deployment
+5. Test on a non-critical device
+</Warning>
+
+### Payload Verification
+
+<Steps>
+  <Step title="Size Check">
+    ```bash
+    # Stage 1 MUST be < 2560 bytes
+    stat -c%s brom-payload/stage1/stage1.bin
+    
+    # Verify not truncated
+    xxd -l 64 brom-payload/stage1/stage1.bin
+    ```
+  </Step>
+
+  <Step title="Entry Point Verification">
+    Check ELF entry points:
+    ```bash
+    arm-none-eabi-readelf -h brom-payload/stage1/stage1.elf | grep Entry
+    ```
+
+    Should match linker script address.
+  </Step>
+
+  <Step title="Section Analysis">
+    Review memory layout:
+    ```bash
+    arm-none-eabi-objdump -h brom-payload/stage1/stage1.elf
+    ```
+
+    Check for unexpected sections or alignment issues.
+  </Step>
+
+  <Step title="Disassembly Review">
+    Inspect generated code:
+    ```bash
+    arm-none-eabi-objdump -d brom-payload/stage1/stage1.elf | less
+    ```
+
+    Look for:
+    - Correct entry point code
+    - No absolute addresses (unless intended)
+    - Thumb instructions (`0x...` not `0x....`)
+  </Step>
+</Steps>
+
+### Integration Testing
+
+1. **Backup original payloads:**
+   ```bash
+   mkdir -p backup
+   cp brom-payload/stage1/stage1.bin backup/
+   cp brom-payload/stage2/stage2.bin backup/
+   cp lk-payload/build/payload.bin backup/lk-payload.bin
+   ```
+
+2. **Deploy modified payload:**
+   ```bash
+   # Payloads are loaded from their build directories
+   python3 modules/main.py
+   ```
+
+3. **Monitor execution:**
+   - Watch for expected magic bytes in serial output
+   - Stage 1: `0xA1A2A3A4`
+   - Stage 2: `0xB1B2B3B4`
+   - PL payload: `0xB1B2B3B4`
+
+4. **Recovery on failure:**
+   ```bash
+   # Restore original payloads
+   cp backup/stage1.bin brom-payload/stage1/
+   cp backup/stage2.bin brom-payload/stage2/
+   ```
+
+## Debugging Build Issues
+
+<AccordionGroup>
+  <Accordion title="Undefined reference errors">
+    **Error:**
+    ```
+    undefined reference to `memcpy'
+    ```
+
+    **Solution:**
+    Implement missing functions in `libc.c` or use `-fno-builtin`.
+  </Accordion>
+
+  <Accordion title="Section overlap errors">
+    **Error:**
+    ```
+    section `.data' overlaps section `.text'
+    ```
+
+    **Solution:**
+    Adjust section addresses in linker script or reduce code size.
+  </Accordion>
+
+  <Accordion title="Relocation errors">
+    **Error:**
+    ```
+    relocation truncated to fit: R_ARM_THM_CALL
+    ```
+
+    **Solution:**
+    - Code too large for relative jumps
+    - Use `-mlong-calls` flag (increases size)
+    - Refactor to reduce distance between functions
+  </Accordion>
+
+  <Accordion title="Binary too large">
+    **Stage 1 payload exceeds 0xA00 bytes**
+
+    **Solutions:**
+    1. Check map file for largest functions:
+       ```bash
+       arm-none-eabi-gcc ... -Wl,-Map=output.map
+       cat output.map | grep .text
+       ```
+    
+    2. Remove debug strings and printf calls
+    
+    3. Use function attributes:
+       ```c
+       __attribute__((optimize("Os")))
+       void my_function() { ... }
+       ```
+    
+    4. Enable link-time optimization:
+       ```makefile
+       CFLAGS += -flto
+       LDFLAGS += -flto
+       ```
+  </Accordion>
+</AccordionGroup>
+
+## Advanced Customization
+
+### Modifying Memory Layout
+
+To change payload load addresses, edit linker scripts:
+
+```ld
+SECTIONS
+{
+  . = 0x<NEW_ADDRESS>;  # Change base address
+  ...
+}
+```
+
+Also update Python loader code in `modules/load_payload.py`:
+
+```python
+# Example: Stage 2 address
+d.write(p32(0x201000))  # Update to match linker script
+```
+
+### Adding New Features
+
+1. **Modify source files** in respective payload directories
+2. **Update Makefile** if adding new source files:
+   ```makefile
+   STAGE1_SRC = stage1.c brom_common.c common.c mynewfile.c
+   ```
+3. **Rebuild** and test size constraints
+4. **Update loader** if protocol changes
+
+### Cross-Compilation for Other Devices
+
+To adapt for different MediaTek SoCs:
+
+1. Change CPU target: `-mcpu=cortex-a9` → `-mcpu=cortex-a53`
+2. Update memory addresses in linker scripts
+3. Modify bootrom-specific code in `brom_common.c`
+4. Update Python device detection (`VID`, `PID`)
+5. Adjust watchdog and hardware register addresses
+
+## Build Automation
+
+Build all payloads at once:
+
+```bash
+#!/bin/bash
+set -e
+
+echo "Building brom-payload..."
+cd brom-payload && make clean && make && cd ..
+
+echo "Building lk-payload..."
+cd lk-payload && make clean && make && cd ..
+
+echo "Building microloader..."
+cd microloader && make clean && make && cd ..
+
+echo "All payloads built successfully!"
+```
+
+Save as `build_all.sh` and run:
+```bash
+chmod +x build_all.sh
+./build_all.sh
+```
+
+## Further Reading
+
+<CardGroup cols={2}>
+  <Card title="ARM Cortex-A9" href="https://developer.arm.com/Processors/Cortex-A9" icon="book">
+    ARM processor technical documentation
+  </Card>
+  <Card title="GNU ARM Toolchain" href="https://developer.arm.com/tools-and-software/open-source-software/developer-tools/gnu-toolchain" icon="wrench">
+    Compiler suite documentation
+  </Card>
+  <Card title="Linker Scripts" href="https://sourceware.org/binutils/docs/ld/Scripts.html" icon="link">
+    GNU LD linker script guide
+  </Card>
+  <Card title="GCC Optimization" href="https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html" icon="gauge">
+    Compiler optimization options
+  </Card>
+</CardGroup>

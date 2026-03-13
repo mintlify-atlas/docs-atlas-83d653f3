@@ -1,0 +1,304 @@
+---
+title: "boot-recovery"
+description: "Boot MediaTek device into recovery mode using preloader handshake"
+---
+
+## Overview
+
+`boot-recovery.sh` forces a MediaTek device into recovery mode by sending a special command through the preloader interface. This provides access to the device's recovery environment without hardware button combinations.
+
+## Syntax
+
+```bash
+./boot-recovery.sh
+```
+
+No arguments or options are required.
+
+## Description
+
+The script performs a preloader handshake and sends the `FACTORYM` command, which instructs the device to boot into recovery mode. This method works when the device is in preloader mode or can be forced into preloader mode.
+
+## Implementation
+
+`boot-recovery.sh` is a wrapper script that calls the Python handshake module:
+
+```bash boot-recovery.sh
+#!/bin/bash
+set -e
+cd modules
+python3 handshake2.py FACTORYM
+cd ..
+```
+
+### Handshake Process
+
+The script executes `handshake2.py` with the `FACTORYM` command (`handshake2.py:8-10`):
+
+```python
+def handshake2(dev, cmd='FACTFACT'):
+    log("Handshake")
+    dev.handshake2(cmd)
+```
+
+### Device Communication
+
+The handshake protocol waits for the preloader ready signal and sends the command (`common.py:129-137`):
+
+```python
+def handshake2(self, cmd='FACTFACT'):
+    # look for start byte
+    c = 0
+    while c != b'Y':
+        c = self.dev.read()
+    log("Preloader ready, sending " + cmd)
+    command = str.encode(cmd)
+    self.dev.write(command)
+    self.dev.flushInput()
+```
+
+## Usage
+
+### Basic Usage
+
+Connect your device and run:
+
+```bash
+./boot-recovery.sh
+```
+
+**Expected output:**
+```
+[INFO] Waiting for device
+[INFO] Found port = /dev/ttyUSB0
+[INFO] Handshake
+[INFO] Preloader ready, sending FACTORYM
+```
+
+The device will then reboot into recovery mode.
+
+### After Running
+
+Once in recovery mode, you can:
+
+- Use the recovery menu to factory reset
+- Sideload OTA updates via ADB
+- Perform partition backups
+- Install custom recovery modifications
+
+```bash
+adb devices
+adb sideload update.zip
+adb reboot
+```
+
+## Device Detection
+
+The script automatically detects MediaTek devices by:
+
+1. Scanning for USB serial ports with VID `0E8D`
+2. Waiting for a new device to appear if none is connected
+3. Opening serial connection at 115200 baud
+4. Setting 5 second timeout for responses
+
+## Exit Codes
+
+| Code | Description |
+|------|-------------|
+| `0` | Success - FACTORYM command sent to device |
+| Non-zero | Error occurred (device not found, communication failure) |
+
+## Process Flow
+
+<Steps>
+  <Step title="Device Detection">
+    Waits for MediaTek device on USB serial port
+  </Step>
+  <Step title="Preloader Ready">
+    Listens for 'Y' byte indicating preloader is ready
+  </Step>
+  <Step title="Send Command">
+    Transmits FACTORYM command to preloader
+  </Step>
+  <Step title="Device Reboots">
+    Device automatically reboots into recovery mode
+  </Step>
+</Steps>
+
+## When to Use
+
+Use `boot-recovery.sh` when you need to:
+
+- Access recovery without physical button combinations
+- Sideload OTA updates programmatically
+- Factory reset a device via recovery
+- Test recovery functionality during development
+- Access recovery on devices with broken volume buttons
+
+<Note>
+  The device must be in preloader mode for this script to work. If your device boots into Android, you may need to use [bootrom-step](/reference/bootrom-step) first to install the custom preloader.
+</Note>
+
+## Troubleshooting
+
+### Device Not Found
+
+**Problem:** Script hangs at "Waiting for device"
+
+**Solutions:**
+- Ensure device is powered off, then connect USB
+- Check USB cable is data-capable (not charge-only)
+- Verify MediaTek USB drivers are installed
+- Try a different USB port
+
+### No Response from Preloader
+
+**Problem:** Script hangs after "Found port"
+
+**Solutions:**
+- Device may not be in preloader mode
+- Disconnect and reconnect USB cable
+- Power cycle the device
+- Check for conflicting serial programs (ModemManager, etc.)
+
+### Permission Denied
+
+**Problem:** Cannot open serial port
+
+**Solutions:**
+```bash
+# Add user to dialout group
+sudo usermod -a -G dialout $USER
+# Log out and back in, or run:
+newgrp dialout
+```
+
+### Device Boots to Wrong Mode
+
+**Problem:** Device boots to fastboot or normal Android instead of recovery
+
+**Solutions:**
+- Verify you're running `boot-recovery.sh` not `boot-fastboot.sh`
+- Check that recovery partition exists and is not corrupted
+- Device may need custom preloader (run [bootrom-step](/reference/bootrom-step))
+
+## Comparison with boot-fastboot
+
+The main difference between `boot-recovery.sh` and `boot-fastboot.sh` is the command sent to preloader:
+
+| Script | Command | Boot Mode | Use Case |
+|--------|---------|-----------|----------|
+| `boot-recovery.sh` | `FACTORYM` | Recovery | System recovery, OTA updates |
+| `boot-fastboot.sh` | `FACTFACT` | Fastboot | Partition flashing, bootloader unlock |
+
+## Related Commands
+
+- [boot-fastboot](/reference/boot-fastboot) - Boot into fastboot mode instead
+- [bootrom-step](/reference/bootrom-step) - Full bootrom exploit and preloader installation
+
+## Prerequisites
+
+- Device must be in preloader mode or bootrom mode
+- USB serial drivers must be installed
+- Python 3 with pyserial library
+- Sufficient permissions to access serial ports
+- Valid recovery partition on device
+
+## Technical Details
+
+### Serial Configuration
+
+- **Baud rate:** 115200
+- **Timeout:** 5 seconds
+- **VID:** 0E8D (MediaTek)
+- **PID:** 0003 (Bootrom) or other (Preloader)
+
+### Command Protocol
+
+The `FACTORYM` command is an 8-byte ASCII string recognized by MediaTek preloaders:
+
+```
+46 41 43 54 4F 52 59 4D  (hex)
+F  A  C  T  O  R  Y  M   (ASCII)
+```
+
+When received during preloader initialization, it instructs the device to:
+1. Skip normal boot sequence
+2. Load recovery kernel from recovery partition
+3. Boot into recovery environment
+4. Mount necessary filesystems for recovery operations
+
+## Safety Considerations
+
+<Note>
+  This script only sends a boot mode command and does not modify device partitions or firmware. It is safe to use and can be cancelled at any time.
+</Note>
+
+## Alternative Methods
+
+If this script doesn't work, you can try:
+
+1. **Hardware buttons:** Power + Volume Up (device-specific)
+2. **ADB reboot:** `adb reboot recovery` (if Android is running)
+3. **Preloader menu:** Some devices have interactive preloader menus
+
+## Recovery Mode Capabilities
+
+Once in recovery mode, you can:
+
+### Via Recovery Menu
+- Wipe data/factory reset
+- Wipe cache partition
+- Apply updates from ADB or SD card
+- Reboot system
+- Power off
+
+### Via ADB
+```bash
+# Check device connection
+adb devices
+
+# Sideload an OTA update
+adb sideload update.zip
+
+# Pull logs for debugging
+adb pull /tmp/recovery.log
+
+# Reboot back to system
+adb reboot
+```
+
+## Use in Automation
+
+You can chain this script with ADB commands for automated device recovery:
+
+```bash
+#!/bin/bash
+# Boot to recovery
+./boot-recovery.sh
+
+# Wait for recovery to fully boot
+sleep 10
+
+# Sideload update
+adb wait-for-device
+adb sideload /path/to/update.zip
+
+# Reboot to system
+adb reboot
+```
+
+<Warning>
+  Always ensure your OTA updates are compatible with your device before sideloading. Incorrect updates can brick your device.
+</Warning>
+
+## Integration with Bootrom Exploit
+
+The recovery partition is validated during the `bootrom-step.sh` exploit process (`main.py:50-51`):
+
+```python
+if "lk" not in gpt or "tee1" not in gpt or "boot" not in gpt or "recovery" not in gpt:
+    raise RuntimeError("bad gpt")
+```
+
+This ensures the recovery partition exists before the exploit completes. If corrupted, use [gpt-fix](/reference/gpt-fix) to repair the partition table.

@@ -1,0 +1,280 @@
+---
+title: "bootrom-step"
+description: "Main exploit script for executing the bootrom exploit and device unlock"
+---
+
+## Overview
+
+`bootrom-step.sh` is the primary script for executing the Kamakiri bootrom exploit. It orchestrates the complete device unlock process, including payload injection, RPMB downgrade, partition flashing, and device modification.
+
+## Syntax
+
+```bash
+./bootrom-step.sh [MODE]
+```
+
+## Modes
+
+### Default Mode (No arguments)
+
+Executes the full bootrom exploit sequence:
+
+```bash
+./bootrom-step.sh
+```
+
+**What it does:**
+- Waits for device connection via USB serial
+- Performs bootrom handshake
+- Loads stage 1 and stage 2 payloads
+- Verifies device type ID (`AKPGW064GI9HE` for mantis)
+- Validates GPT partition structure
+- Downgrades RPMB to enable firmware rollback
+- Flashes downgraded TZ (TrustZone) and LK (Little Kernel)
+- Installs lk-payload to boot0 partition
+- Injects microloader into boot partition
+- Forces device into fastboot mode
+- Flashes preloader (if device was in bootrom mode)
+- Reboots device
+
+### Crash Mode
+
+Attempts to crash the device's preloader to access bootrom:
+
+```bash
+./bootrom-step.sh crash
+```
+
+**What it does:**
+- Detects if device is in preloader mode
+- Sends crafted payload to crash preloader
+- Forces device back to bootrom mode for exploitation
+- Continues with standard exploit sequence
+
+<Note>
+  Use crash mode when your device boots into preloader instead of bootrom. The exploit will automatically retry until the device enters bootrom mode.
+</Note>
+
+### GPT Fix Mode
+
+Repairs corrupted GPT partition tables:
+
+```bash
+./bootrom-step.sh fixgpt
+```
+
+**What it does:**
+- Loads exploit payload
+- Verifies device type
+- Switches to eMMC user partition
+- Flashes known-good GPT structure from `bin/gpt-mantis.bin`
+- Flashes first 34 sectors (17KB) containing GPT header and partition entries
+
+<Warning>
+  GPT fix mode will overwrite your existing partition table. Use only if you have a corrupted GPT or know what you're doing.
+</Warning>
+
+## Implementation Details
+
+`bootrom-step.sh` is a wrapper script that calls the Python implementation:
+
+```bash bootrom-step.sh
+#!/bin/bash
+set -e
+cd modules
+python3 main.py $@
+cd ..
+```
+
+### Device Detection
+
+The script waits for a MediaTek device with VID `0E8D` to appear on USB serial (`main.py:124`):
+
+```python
+dev = Device()
+dev.find_device()
+```
+
+### Crash Mode Logic
+
+When crash mode is enabled, the script loops until device exits preloader mode (`main.py:126-133`):
+
+```python
+if (len(sys.argv) == 2 and sys.argv[1] == "crash") or (len(sys.argv) == 3 and sys.argv[2] == "crash"):
+    while dev.preloader:
+        log("Found device in preloader mode, trying to crash...")
+        dev.handshake()
+        dev.crash_pl()
+        dev.dev.close()
+        dev = Device()
+        dev.find_device()
+```
+
+### GPT Fix Implementation
+
+GPT fix mode writes a pre-built partition table to the eMMC (`main.py:38-41`):
+
+```python
+if len(sys.argv) == 2 and sys.argv[1] == "fixgpt":
+    dev.emmc_switch(0)
+    log("Flashing GPT")
+    flash_binary(dev, "../bin/gpt-mantis.bin", 0, 34 * 0x200)
+```
+
+## Exit Codes
+
+| Code | Description |
+|------|-------------|
+| `0` | Success - device exploited and rebooted |
+| `1` | Device type mismatch - not a supported mantis device |
+| Non-zero | Runtime error during exploit execution |
+
+## Process Flow
+
+<Steps>
+  <Step title="Device Connection">
+    Waits for MediaTek device on USB serial port
+  </Step>
+  <Step title="Crash Preloader (if needed)">
+    Attempts to crash preloader if device is not in bootrom mode
+  </Step>
+  <Step title="Payload Loading">
+    Loads stage 1 and stage 2 exploit payloads into bootrom memory
+  </Step>
+  <Step title="Device Verification">
+    Checks device type ID matches expected mantis device
+  </Step>
+  <Step title="GPT Fix (if requested)">
+    Repairs GPT partition table before continuing
+  </Step>
+  <Step title="Partition Validation">
+    Verifies critical partitions exist: lk, tee1, boot, recovery
+  </Step>
+  <Step title="RPMB Downgrade">
+    Zeroes RPMB to enable firmware rollback
+  </Step>
+  <Step title="Firmware Flashing">
+    Installs downgraded TZ, LK, lk-payload, and microloader
+  </Step>
+  <Step title="Fastboot Mode">
+    Forces device into fastboot for further modifications
+  </Step>
+  <Step title="Preloader Installation">
+    Flashes custom preloader if needed
+  </Step>
+  <Step title="Reboot">
+    Reboots device to complete exploit
+  </Step>
+</Steps>
+
+## Usage Examples
+
+### Standard Exploit
+
+Run the full exploit on a device in bootrom mode:
+
+```bash
+./bootrom-step.sh
+```
+
+**Expected output:**
+```
+[INFO] Waiting for device
+[INFO] Found port = /dev/ttyUSB0
+[INFO] Handshake
+[INFO] Load payload
+[INFO] Check device_type_id
+[INFO] Detected mantis (AKPGW064GI9HE)
+[INFO] Check GPT
+[INFO] Check boot0
+[INFO] Check rpmb
+[INFO] Downgrade rpmb
+[INFO] Flash tz
+[INFO] Flash lk
+[INFO] Flash lk-payload
+[INFO] Inject microloader
+[INFO] Force fastboot
+[INFO] Flash preloader
+[INFO] Reboot
+```
+
+### Crash Preloader First
+
+For devices booting into preloader:
+
+```bash
+./bootrom-step.sh crash
+```
+
+### Fix Corrupted GPT
+
+Repair partition table before exploitation:
+
+```bash
+./bootrom-step.sh fixgpt
+```
+
+## Error Handling
+
+### Wrong Device Type
+
+If device type ID doesn't match:
+
+```
+[INFO] Wrong device detected: AKPGW064XXXXX
+```
+
+**Solution:** Ensure you're using a supported mantis device.
+
+### Bad GPT
+
+If required partitions are missing:
+
+```
+RuntimeError: bad gpt
+```
+
+**Solution:** Run `./bootrom-step.sh fixgpt` to repair GPT.
+
+### RPMB Downgrade Failure
+
+If RPMB cannot be downgraded:
+
+```
+[INFO] downgrade failure, giving up
+```
+
+**Solution:** Device will automatically reboot. Try running the exploit again.
+
+## Related Commands
+
+- [boot-fastboot](/reference/boot-fastboot) - Boot device into fastboot mode
+- [boot-recovery](/reference/boot-recovery) - Boot device into recovery mode
+- [gpt-fix](/reference/gpt-fix) - Standalone GPT repair utility
+
+## Safety Considerations
+
+<Warning>
+  - This script performs irreversible low-level modifications to your device
+  - RPMB downgrade permanently removes device verification
+  - Flashing incorrect firmware can brick your device
+  - Always ensure battery is charged above 50% before running
+  - Keep USB connection stable throughout the process
+</Warning>
+
+## Prerequisites
+
+- Device must be powered off before starting
+- USB serial drivers must be installed
+- ModemManager must be disabled (checked automatically)
+- All payloads must be built (see [Building Payloads](/advanced/building-payloads))
+- Binary files must exist in `bin/` directory
+
+## Technical Notes
+
+- Script sets `set -e` to exit on any error
+- Changes to `modules/` directory for execution
+- Passes all arguments directly to `main.py`
+- Serial communication uses 115200 baud rate
+- Timeout set to 5 seconds for device responses
+- Watchdog timer kicked periodically during long operations

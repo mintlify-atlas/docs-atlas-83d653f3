@@ -1,0 +1,458 @@
+---
+title: 'Payload System'
+description: 'Multi-stage payload architecture and implementation details'
+---
+
+## Multi-Stage Architecture
+
+Kamakiri uses a multi-stage payload system where each stage provides progressively more functionality. This approach is necessary because:
+
+1. **Size constraints**: Initial exploit payload must be < 0xA00 bytes
+2. **Functionality gaps**: BootROM has limited capabilities
+3. **Persistent access**: Need automatic loading on subsequent boots
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│ BootROM  │ -> │ Stage 1  │ -> │ Stage 2  │ -> │Microloader│ -> │LK Payload│
+│ Exploit  │    │ 0x100A00 │    │ 0x201000 │    │  eMMC    │    │  Hooks   │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+   < 1KB          < 2.5KB         Full size       < 512KB         < 512KB
+```
+
+## Stage 1: Initial Exploit Payload
+
+### Purpose
+
+Provide basic memory access after initial exploit succeeds.
+
+### Location
+
+- **Address**: `0x100A00`
+- **Max size**: `0xA00` bytes (2560 bytes)
+- **Source**: `brom-payload/stage1/stage1.bin`
+
+### Implementation
+
+<CodeGroup>
+```c brom-payload/stage1.c
+int main() {
+    print("Entered 1ST stage payload\n");
+    print("Copyright xyz, k4y0z 2019\n");
+
+    // Send USB response to prevent timeout
+    send_usb_response(0,0,1);
+
+    // Signal ready state
+    send_dword(0xA1A2A3A4);
+
+    while (1) {
+        uint32_t magic = recv_dword();
+        if (magic != 0xf00dd00d) {
+            break;  // Protocol error
+        }
+        uint32_t cmd = recv_dword();
+        // Process command...
+    }
+}
+```
+</CodeGroup>
+
+### Command Set
+
+| Command | Value | Description |
+|---------|-------|-------------|
+| Write Memory | `0x4000` | Write data to arbitrary address |
+| Jump | `0x4001` | Execute code at address |
+| Reboot | `0x3000` | Reset the device |
+| Kick Watchdog | `0x3001` | Prevent watchdog timeout |
+
+### Write Memory Command (`0x4000`)
+
+```python
+# Host sends:
+dev.dev.write(p32(0xf00dd00d))  # Magic
+dev.dev.write(p32(0x4000))       # Command
+dev.dev.write(p32(address))      # Target address
+dev.dev.write(p32(size))         # Data size
+dev.dev.write(data)              # Payload data
+
+# Device responds:
+code = dev.dev.read(4)
+# 0xD0D0D0D0 = success
+# 0xF0F0F0F0 = failure
+```
+
+### Jump Command (`0x4001`)
+
+Used to transition to stage 2:
+
+```python
+# Load stage 2 to memory
+dev.dev.write(p32(0xf00dd00d))
+dev.dev.write(p32(0x4000))
+dev.dev.write(p32(0x201000))  # Stage 2 address
+dev.dev.write(p32(len(stage2)))
+dev.dev.write(stage2)
+
+# Jump to stage 2
+dev.dev.write(p32(0xf00dd00d))
+dev.dev.write(p32(0x4001))
+dev.dev.write(p32(0x201000))  # Execute stage 2
+```
+
+<Note>
+Stage 1 runs entirely in RAM and does not access eMMC storage.
+</Note>
+
+## Stage 2: Full eMMC Access
+
+### Purpose
+
+Provide complete eMMC read/write capabilities and advanced memory operations.
+
+### Location
+
+- **Address**: `0x201000`
+- **Max size**: Unlimited (loaded by stage 1)
+- **Source**: `brom-payload/stage2/stage2.bin`
+
+### Implementation
+
+<CodeGroup>
+```c brom-payload/stage2.c
+int main() {
+    printf("Entered 2ND stage payload\n");
+    printf("Copyright xyz, k4y0z 2019\n");
+
+    struct msdc_host host = { 0 };
+    host.ocr_avail = MSDC_OCR_AVAIL;
+
+    mmc_init(&host);         // Initialize eMMC
+    command_loop(&host);     // Enter command loop
+}
+```
+</CodeGroup>
+
+### Extended Command Set
+
+| Command | Value | Description |
+|---------|-------|-------------|
+| Read Block | `0x1000` | Read 512-byte eMMC block |
+| Write Block | `0x1001` | Write 512-byte eMMC block |
+| Switch Partition | `0x1002` | Change eMMC partition |
+| Read RPMB | `0x2000` | Read RPMB secure storage |
+| Write RPMB | `0x2001` | Write RPMB secure storage |
+| Memory Read | `0x5000` | Read arbitrary memory |
+| IDME Read | `0x7000` | Read IDME fields |
+| Reboot | `0x3000` | Reset device |
+| Kick Watchdog | `0x3001` | Prevent timeout |
+
+### eMMC Operations
+
+<Tabs>
+  <Tab title="Read Block">
+    ```python
+    def emmc_read(self, idx):
+        # magic
+        self.dev.write(p32_be(0xf00dd00d))
+        # cmd
+        self.dev.write(p32_be(0x1000))
+        # block to read
+        self.dev.write(p32_be(idx))
+
+        data = self.dev.read(0x200)  # 512 bytes
+        if len(data) != 0x200:
+            raise RuntimeError("read fail")
+
+        return data
+    ```
+  </Tab>
+  
+  <Tab title="Write Block">
+    ```python
+    def emmc_write(self, idx, data):
+        if len(data) != 0x200:
+            raise RuntimeError("data must be 0x200 bytes")
+
+        # magic
+        self.dev.write(p32_be(0xf00dd00d))
+        # cmd
+        self.dev.write(p32_be(0x1001))
+        # block to write
+        self.dev.write(p32_be(idx))
+        # data
+        self.dev.write(data)
+
+        code = self.dev.read(4)
+        if code != b"\xd0\xd0\xd0\xd0":
+            raise RuntimeError("device failure")
+    ```
+  </Tab>
+  
+  <Tab title="Switch Partition">
+    ```python
+    def emmc_switch(self, part):
+        # magic
+        self.dev.write(p32_be(0xf00dd00d))
+        # cmd
+        self.dev.write(p32_be(0x1002))
+        # partition (0=user, 1=boot0, 2=boot1, etc.)
+        self.dev.write(p32_be(part))
+    ```
+  </Tab>
+</Tabs>
+
+### eMMC Partitions
+
+| Partition | ID | Description |
+|-----------|-----|-------------|
+| USER | 0 | Main user data partition |
+| BOOT0 | 1 | Boot partition 0 (microloader/payload) |
+| BOOT1 | 2 | Boot partition 1 (backup) |
+| RPMB | 3 | Replay Protected Memory Block |
+
+<Warning>
+Writing to BOOT partitions can brick the device if done incorrectly. Always backup before modifying.
+</Warning>
+
+## Microloader: Persistent Payload Injection
+
+### Purpose
+
+Automatically load the LK payload on every boot without requiring the exploit to be re-run.
+
+### Location
+
+- **Storage**: eMMC BOOT0 partition
+- **Address**: `PAYLOAD_SRC` (device-specific)
+- **Backup**: `BACKUP_SRC` (fallback location)
+- **Execution**: Loaded at `PAYLOAD_DST` by preloader
+- **Source**: `microloader/main.c`
+
+### Implementation
+
+<CodeGroup>
+```c microloader/main.c
+int main() {
+    puts("microloader");
+
+    struct device_t *dev = (void*)get_device();
+
+    // Try to load payload from primary location
+    uint32_t *dst = (void*)PAYLOAD_DST;
+    size_t ret = dev->read(dev, PAYLOAD_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+
+    // If invalid, try backup location
+    if(*dst != 0xe3a0d442) {
+        puts("Try backup");
+        size_t ret = dev->read(dev, BACKUP_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+    }
+
+    cache_clean(dst, PAYLOAD_SIZE);
+
+    // Jump to the payload
+    void (*jump)(void) = (void*)dst;
+    puts("Jump");
+    jump();
+}
+```
+</CodeGroup>
+
+### Boot Flow with Microloader
+
+```
+┌─────────┐
+│BootROM  │ Powers on, loads preloader from eMMC
+└────┬────┘
+     │
+┌────▼────────┐
+│ Preloader   │ Modified to include microloader
+└────┬────────┘
+     │
+┌────▼────────┐
+│Microloader  │ Reads LK payload from BOOT0 partition
+└────┬────────┘
+     │
+┌────▼────────┐
+│LK Payload   │ Hooks boot process, loads system
+└────┬────────┘
+     │
+┌────▼────────┐
+│Little Kernel│ Modified with hooks
+└─────────────┘
+```
+
+<Note>
+The microloader is injected into the preloader binary that's stored in the BOOT0 partition.
+</Note>
+
+## LK Payload: Boot Process Manipulation
+
+### Purpose
+
+Modify the Little Kernel bootloader to:
+- Bypass secure boot verification
+- Enable fastboot mode on demand
+- Hook boot image loading
+- Ensure payload persistence
+
+### Location
+
+- **Address**: `0x41E00000` (LK_BASE)
+- **Size**: LK_SIZE
+- **Source**: `lk-payload/main.c`
+
+### Implementation
+
+<CodeGroup>
+```c lk-payload/main.c
+int main() {
+    printf("This is LK-payload for mantis by xyz and k4y0z. Copyright 2019\n");
+
+    // Parse GPT to find boot/recovery/lk partitions
+    parse_gpt();
+
+    // Check for fastboot flag in MISC partition
+    dev->read(dev, g_misc * 0x200, bootloader_msg, 0x20, USER_PART);
+    
+    if(strncmp(bootloader_msg, "boot-amonet", 11) == 0) {
+        fastboot = 1;
+    }
+
+    // Patch device unlock check
+    patch = (void*)0x41E01D34;
+    *patch++ = 0x2001; // movs r0, #1
+    *patch = 0x4770;   // bx lr
+
+    // Hook bootimg read function
+    original_read = (void*)dev->read;
+    patch32 = (void*)&dev->read;
+    *patch32 = (uint32_t)read_func;
+
+    // Continue LK execution
+    int (*app)() = (void*)0x41E25371;
+    app();
+}
+```
+</CodeGroup>
+
+### Boot Manipulation
+
+The LK payload intercepts boot image reads to:
+
+```c
+size_t read_func(struct device_t *dev, uint64_t block_off, void *dst, 
+                 uint32_t sz, uint32_t part) {
+    if (block_off == g_boot * 0x200 || block_off == g_recovery * 0x200) {
+        // Demangle boot image
+        // Boot images are offset by 0x400 bytes
+        if (sz < 0x400) {
+            ret = original_read(dev, block_off + 0x400, dst, sz, part);
+        } else {
+            // Copy second 0x400 bytes to beginning
+            ret = original_read(dev, block_off, dst, sz, part);
+            memcpy(dst, second_copy, 0x400);
+        }
+    }
+    return ret;
+}
+```
+
+### MISC Partition Flags
+
+The LK payload reads flags from the MISC partition to control boot behavior:
+
+| Flag | Behavior |
+|------|----------|
+| `boot-amonet` | Boot into fastboot mode (temporary) |
+| `FASTBOOT_PLEASE` | Boot into fastboot mode (permanent) |
+| `boot-recovery` | Boot into recovery mode |
+| `boot-system` | Force normal system boot |
+| `UART_PLEASE` | Enable UART debug output |
+
+### Security Patches
+
+<CodeGroup>
+```c Device Unlock Check
+// Patch at 0x41E01D34 - always return "unlocked"
+patch = (void*)0x41E01D34;
+*patch++ = 0x2001; // movs r0, #1 (true)
+*patch = 0x4770;   // bx lr (return)
+```
+
+```c Amazon Unlock Verification
+// Patch at 0x41E01EA0 - enable all fastboot commands
+patch = (void*)0x41E01EA0;
+*patch++ = 0x2000; // movs r0, #0 (success)
+*patch = 0x4770;   // bx lr (return)
+```
+</CodeGroup>
+
+### Payload Backup
+
+The LK payload ensures persistence by verifying a backup copy exists:
+
+```c
+// Check if backup payload is present
+dev->read(dev, BACKUP_SRC, (void*)0x45000000, PAYLOAD_SIZE, BOOT0_PART);
+if (memcmp((void*)PAYLOAD_DST, (void*)0x45000000, PAYLOAD_SIZE)) {
+    printf("Backup payload not found...\n");
+    printf("...copy payload to backup location\n");
+    dev->write(dev, (void*)PAYLOAD_DST, BACKUP_SRC, PAYLOAD_SIZE, BOOT0_PART);
+}
+```
+
+## Memory Addresses Reference
+
+### Stage 1 Addresses
+
+| Address | Purpose |
+|---------|--------|
+| `0x100A00` | Stage 1 payload location |
+| `0x10007000` | Watchdog timer base |
+| `0x10007008` | Watchdog kick register |
+
+### Stage 2 Addresses
+
+| Address | Purpose |
+|---------|--------|
+| `0x201000` | Stage 2 payload location |
+| `0x10210000` | Crypto engine base |
+
+### LK Addresses
+
+| Address | Purpose |
+|---------|--------|
+| `0x41E00000` | LK base (LK_BASE) |
+| `0x41E00020` | Argument pointer |
+| `0x41E01D34` | Device unlock check |
+| `0x41E01EA0` | Amazon unlock verify |
+| `0x41E25371` | LK main entry point |
+| `0x41E5D904` | Boot reason pointer |
+| `0x11003000` | UART base |
+
+## Protocol Signature
+
+All commands use the magic value `0xf00dd00d` to prevent protocol desynchronization:
+
+```python
+MAGIC = 0xf00dd00d
+
+# Every command starts with magic
+dev.dev.write(p32_be(MAGIC))
+dev.dev.write(p32_be(command))
+dev.dev.write(p32_be(arg1))
+# ...
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Device Communication" icon="tower-broadcast" href="./device-communication">
+    Learn about the serial protocol implementation
+  </Card>
+  
+  <Card title="Usage Guide" icon="book" href="/usage/quickstart">
+    See practical examples of payload usage
+  </Card>
+</CardGroup>

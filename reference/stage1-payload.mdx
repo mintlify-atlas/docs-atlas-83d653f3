@@ -1,0 +1,210 @@
+---
+title: Stage 1 Payload
+description: First-stage bootrom payload for initial exploitation
+---
+
+## Overview
+
+The Stage 1 payload is the first code executed after exploiting the MediaTek bootrom vulnerability. It runs in a highly constrained environment with limited memory and provides a minimal command interface for uploading and executing the Stage 2 payload.
+
+## Memory Layout
+
+The Stage 1 payload is loaded at a specific memory address defined in the linker script:
+
+```ld
+. = 0x100a00;
+```
+
+This payload must be small and carefully crafted to fit within the available space in the bootrom's internal SRAM.
+
+<Warning>
+The Stage 1 payload runs with strict size constraints. Keep the code minimal to ensure it fits within the bootrom's internal SRAM.
+</Warning>
+
+## Initialization
+
+When the Stage 1 payload starts execution, it performs the following initialization:
+
+```c
+int main() {
+    print("Entered 1ST stage payload\n");
+    print("Copyright xyz, k4y0z 2019\n");
+
+    // This is so we don't get a USB-Timeout
+    print("Send USB response\n");
+    send_usb_response(0,0,1);
+
+    print("Entering command loop\n");
+    send_dword(0xA1A2A3A4);
+
+    // Command loop...
+}
+```
+
+### Key Steps
+
+1. **Send USB Response**: Prevents USB timeout by sending an acknowledgment to the host
+2. **Send Magic Value**: Transmits `0xA1A2A3A4` to signal readiness for commands
+3. **Enter Command Loop**: Begins processing commands from the host
+
+## Protocol
+
+The Stage 1 payload implements a simple binary protocol for communication:
+
+### Message Format
+
+1. **Magic Header**: `0xf00dd00d` (validates each command)
+2. **Command Code**: 32-bit command identifier
+3. **Command-specific data**: Parameters based on command type
+
+```c
+while (1) {
+    uint32_t magic = recv_dword();
+    if (magic != 0xf00dd00d) {
+        print("Protocol error\n");
+        break;
+    }
+    uint32_t cmd = recv_dword();
+    // Process command...
+}
+```
+
+## Supported Commands
+
+### 0x4000 - Write Memory
+
+Writes arbitrary data to memory at a specified address.
+
+**Parameters:**
+- `address` (uint32_t): Destination memory address
+- `size` (uint32_t): Number of bytes to write
+- `data`: Raw bytes to write
+
+**Response:**
+- `0xD0D0D0D0`: Success
+- `0xF0F0F0F0`: Failure
+
+```c
+case 0x4000: {
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    print("Write\n");
+    if(recv_data(address, size, 0) == 0) {
+        print("OK\n");
+        send_dword(0xD0D0D0D0);
+    } else {
+        send_dword(0xF0F0F0F0);
+        print("Read fail\n");
+    }
+    break;
+}
+```
+
+### 0x4001 - Jump to Address
+
+Transfers execution to a specified memory address. This is typically used to execute the Stage 2 payload after uploading it.
+
+**Parameters:**
+- `address` (uint32_t): Target address to jump to
+
+```c
+case 0x4001: {
+    void (*jump_address)(void) = (void*) recv_dword();
+    print("Jump\n");
+    jump_address();
+    break;
+}
+```
+
+<Note>
+After jumping to the Stage 2 payload, control does not return to Stage 1.
+</Note>
+
+### 0x3000 - Reboot Device
+
+Triggers a hardware reset of the device using the watchdog timer.
+
+**Parameters:** None
+
+```c
+case 0x3000: {
+    print("Reboot\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;
+    reg[0/4] = 0x22000014;
+    reg[0x14/4] = 0x1209;
+
+    while (1) {
+        // Wait for reset
+    }
+}
+```
+
+### 0x3001 - Kick Watchdog
+
+Resets the watchdog timer to prevent automatic device reset.
+
+**Parameters:** None
+
+```c
+case 0x3001: {
+    print("Kick watchdog\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;
+    break;
+}
+```
+
+## Usage Flow
+
+The typical usage flow for Stage 1 is:
+
+1. **Exploit bootrom vulnerability** to execute Stage 1 payload
+2. **Wait for magic value** `0xA1A2A3A4` from device
+3. **Upload Stage 2 payload** using `0x4000` (Write Memory) command
+4. **Jump to Stage 2** using `0x4001` command
+
+<Accordion title="Example Host Communication">
+```python
+# Wait for Stage 1 ready signal
+magic = device.recv_dword()
+assert magic == 0xA1A2A3A4
+
+# Upload Stage 2 to memory
+device.send_dword(0xf00dd00d)  # Protocol magic
+device.send_dword(0x4000)       # Write command
+device.send_dword(0x201000)     # Target address
+device.send_dword(len(stage2))  # Size
+device.send_data(stage2)        # Payload data
+
+# Wait for confirmation
+response = device.recv_dword()
+assert response == 0xD0D0D0D0
+
+# Jump to Stage 2
+device.send_dword(0xf00dd00d)  # Protocol magic
+device.send_dword(0x4001)       # Jump command
+device.send_dword(0x201000)     # Stage 2 address
+```
+</Accordion>
+
+## Source Code Location
+
+The Stage 1 payload implementation can be found at:
+- **Main code**: `brom-payload/stage1.c`
+- **Linker script**: `brom-payload/stage1.ld`
+- **Common headers**: `brom-payload/common.h`, `brom-payload/brom_common.h`
+
+## Limitations
+
+- **No eMMC access**: Stage 1 cannot read or write to storage
+- **Limited memory**: Must fit within bootrom internal SRAM
+- **No printf**: Uses simple `print()` function for debugging
+- **Basic commands only**: Full functionality requires Stage 2
+
+## Next Steps
+
+After Stage 1 executes successfully:
+1. Upload the [Stage 2 payload](/reference/stage2-payload)
+2. Stage 2 initializes eMMC and provides full storage access
+3. Stage 2 can then load and execute additional payloads

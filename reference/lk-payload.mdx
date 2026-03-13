@@ -1,0 +1,369 @@
+---
+title: LK Payload
+description: Little Kernel payload for persistent bootloader modifications
+---
+
+## Overview
+
+The LK (Little Kernel) payload is a persistent modification to the device's bootloader that runs during normal boot. It is loaded by the [microloader](/reference/microloader) and provides advanced features like forced fastboot mode, boot image manipulation, and device unlock patches.
+
+Unlike the bootrom payloads (Stage 1 and Stage 2), the LK payload runs during every boot and can modify the boot process before the Android kernel loads.
+
+## Memory Layout
+
+The LK payload is designed to be injected into the existing Little Kernel bootloader:
+
+```c
+#define LK_BASE (0x41E00000)
+#define LK_SIZE (1024 * 1024)
+```
+
+The payload itself is stored in boot0 and loaded by the microloader:
+
+```c
+#define PAYLOAD_DST 0x41000000
+#define PAYLOAD_SRC 0x80000
+#define PAYLOAD_SIZE 0x80000
+```
+
+## Initialization
+
+When the LK payload executes, it performs several critical tasks:
+
+```c
+int main() {
+    int ret = 0;
+    printf("This is LK-payload for mantis by xyz and k4y0z. Copyright 2019\n");
+
+    uint32_t **argptr = (void*)0x41E00020;
+    uint32_t *arg = *argptr;
+    uint32_t* o_boot_mode = (uint32_t*) *argptr + 1; // argptr boot mode
+
+    int fastboot = 0;
+
+    boot_reason = (uint32_t *)(*(uint32_t *)(0x41E5D904) + 272);
+    y_cable = (uint8_t *)(*(uint32_t *)(0x41E5D904) + 365);
+
+    printf("boot_reason: %u\n", *boot_reason);
+    printf("y_cable: %u\n", *y_cable);
+
+    parse_gpt();
+    // ...
+}
+```
+
+## Boot Mode Detection
+
+The payload reads various boot parameters to determine the appropriate action:
+
+### Boot Reason and Cable Detection
+
+```c
+uint32_t * boot_reason = 0;
+uint8_t * y_cable = 0;
+uint8_t boot_system = 0;
+
+boot_reason = (uint32_t *)(*(uint32_t *)(0x41E5D904) + 272);
+y_cable = (uint8_t *)(*(uint32_t *)(0x41E5D904) + 365);
+```
+
+- **boot_reason**: Indicates why the device booted (normal, recovery, etc.)
+- **y_cable**: Detects if a factory cable is connected
+- **boot_system**: Flag to force normal system boot
+
+### Boot Mode Values
+
+```c
+uint32_t *g_boot_mode = (uint32_t*) 0x41E5544C;
+```
+
+Common boot modes:
+- **0**: Normal boot
+- **2**: Recovery mode
+- **4**: Factory mode
+- **6**: Advanced factory mode
+- **99**: Fastboot mode (custom value used by payload)
+
+## GPT Parsing
+
+The payload parses the GUID Partition Table to locate critical partitions:
+
+```c
+static void parse_gpt() {
+    uint8_t raw[0x800] = { 0 };
+    struct device_t *dev = get_device();
+    dev->read(dev, 0x400, raw, sizeof(raw), USER_PART);
+    for (size_t i = 0; i < sizeof(raw) / 0x80; ++i) {
+        uint8_t *ptr = &raw[i * 0x80];
+        uint8_t *name = ptr + 0x38;
+        uint32_t start;
+        memcpy(&start, ptr + 0x20, 4);
+        if (memcmp(name, "b\x00o\x00o\x00t\x00\x00\x00", 10) == 0) {
+            printf("found boot at 0x%08X\n", start);
+            g_boot = start;
+        } else if (memcmp(name, "r\x00\x65\x00\x63\x00o\x00v\x00\x65\x00r\x00y\x00\x00\x00", 18) == 0) {
+            printf("found recovery at 0x%08X\n", start);
+            g_recovery = start;
+        } else if (memcmp(name, "l\x00k\x00\x00\x00", 6) == 0) {
+            printf("found lk at 0x%08X\n", start);
+            g_lk = start;
+        } else if (memcmp(name, "M\x00I\x00S\x00\x43\x00\x00\x00", 10) == 0) {
+            printf("found misc at 0x%08X\n", start);
+            g_misc = start;
+        }
+    }
+}
+```
+
+<Note>
+Partition names in GPT are stored as UTF-16LE (wide characters), hence the `\x00` bytes between characters.
+</Note>
+
+## Fastboot Mode Forcing
+
+The payload can force the device into fastboot mode based on several conditions:
+
+### Factory Mode Detection
+
+```c
+// factory and factory advanced boot
+if(*o_boot_mode == 4 ) {
+    fastboot = 1;
+}
+```
+
+### Microloader Signal
+
+```c
+// microloader
+uint8_t *tmp = (void*)0x41e0062c;
+if (strncmp(tmp, "FASTBOOT_PLEASE", 15) == 0 ) {
+    fastboot = 1;
+}
+```
+
+### MISC Partition Flags
+
+The payload reads flags from the MISC partition to control boot behavior:
+
+```c
+uint8_t bootloader_msg[0x20] = { 0 };
+dev->read(dev, g_misc * 0x200, bootloader_msg, 0x20, USER_PART);
+printf("bootloader_msg: %s\n", bootloader_msg);
+
+// temp flag on MISC
+if(strncmp(bootloader_msg, "boot-amonet", 11) == 0) {
+    fastboot = 1;
+    // reset flag
+    memset(bootloader_msg, 0, 0x10);
+    dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+}
+
+// perm flag on MISC
+else if(strncmp(bootloader_msg, "FASTBOOT_PLEASE", 15) == 0) {
+    // only reset flag in recovery-boot
+    if(*g_boot_mode == 2) {
+        memset(bootloader_msg, 0, 0x10);
+        dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+    }
+    else {
+        fastboot = 1;
+    }
+}
+```
+
+<Accordion title="MISC Partition Boot Flags">
+- **boot-amonet**: Temporary fastboot (flag cleared after use)
+- **FASTBOOT_PLEASE**: Persistent fastboot (only cleared in recovery)
+- **boot-recovery**: Force recovery mode
+- **boot-system**: Force normal system boot
+- **UART_PLEASE** (at offset +0x10): Enable UART logging
+</Accordion>
+
+### Applying Fastboot Mode
+
+When fastboot is triggered:
+
+```c
+if (fastboot) {
+    printf("well since you're asking so nicely...\n");
+
+    if(*g_boot_mode == 2) *o_boot_mode = 2;
+    
+    *g_boot_mode = 99;
+
+    video_printf("=> HACKED FASTBOOT mode: (%d) - xyz, k4y0z\n", *o_boot_mode);
+}
+```
+
+Setting `g_boot_mode` to 99 forces Little Kernel to enter fastboot mode.
+
+## Device Unlock Patches
+
+The payload applies binary patches to unlock the bootloader:
+
+```c
+// device is unlocked
+patch = (void*)0x41E01D34;
+*patch++ = 0x2001; // movs r0, #1
+*patch = 0x4770;   // bx lr
+
+// amzn_verify_unlock (enable all commands)
+patch = (void*)0x41E01EA0;
+*patch++ = 0x2000; // movs r0, #0
+*patch = 0x4770;   // bx lr
+```
+
+These patches:
+1. **0x41E01D34**: Make the bootloader report the device as unlocked
+2. **0x41E01EA0**: Bypass Amazon's unlock verification (enables all fastboot commands)
+
+<Warning>
+These memory addresses are specific to certain LK versions. Different devices or firmware versions may require different patch addresses.
+</Warning>
+
+## Boot Image Hooking
+
+The payload hooks the boot image read function to manipulate boot/recovery images:
+
+```c
+size_t (*original_read)(struct device_t *dev, uint64_t block_off, void *dst, uint32_t sz, uint32_t part); 
+
+size_t read_func(struct device_t *dev, uint64_t block_off, void *dst, uint32_t sz, uint32_t part) {
+    printf("read_func hook\n");
+    int ret = 0;
+    if (block_off == g_boot * 0x200 || block_off == g_recovery * 0x200) {
+        printf("demangle boot image - from 0x%08X\n", __builtin_return_address(0));
+
+        if (block_off == g_boot * 0x200 && *y_cable == 1 && !boot_system && *boot_reason == 0) {
+            printf("Boot into recovery to display bootmenu");
+            block_off = g_recovery * 0x200;
+        }
+        if (sz < 0x400) {
+            ret = original_read(dev, block_off + 0x400, dst, sz, part);
+        } else {
+            void *second_copy = (char*)dst + 0x400;
+            ret = original_read(dev, block_off, dst, sz, part);
+            memcpy(dst, second_copy, 0x400);
+            memset(second_copy, 0, 0x400);
+        }
+    } else {
+        ret = original_read(dev, block_off, dst, sz, part);
+    }
+    return ret;
+}
+```
+
+### Hook Installation
+
+```c
+// hook bootimg read function
+uint32_t *patch32;
+original_read = (void*)dev->read;
+patch32 = (void*)&dev->read;
+*patch32 = (uint32_t)read_func;
+```
+
+This hook:
+1. **Detects boot/recovery reads**: Intercepts when LK reads boot or recovery partition
+2. **Demangling**: Skips the first 0x400 bytes (1KB) of boot images, effectively "demangling" them
+3. **Boot menu**: With factory cable, redirects boot to recovery for menu display
+
+<Note>
+The "demangling" compensates for boot images that have been "mangled" by duplicating their headers.
+</Note>
+
+## Microloader Integration
+
+The payload restores memory that was overwritten by the microloader:
+
+```c
+struct device_t *dev = get_device();
+
+// Restore the 0x41E00200-0x41E01200 range, a part of it was overwritten by microloader
+// this is way more than we actually need to restore, but it shouldn't hurt
+// we can't restore 0x41E00000-0x41E00200 as that contains important pointers
+dev->read(dev, g_lk * 0x200 + 0x200 + 0x200, (char*)LK_BASE + 0x200, 0x1000, USER_PART);
+```
+
+### Backup Verification
+
+The payload also verifies and creates a backup of itself:
+
+```c
+//Check if backup payload is present and copy if not
+dev->read(dev, BACKUP_SRC, (void*)0x45000000, PAYLOAD_SIZE, BOOT0_PART);
+if (memcmp((void*)PAYLOAD_DST, (void*)0x45000000, PAYLOAD_SIZE)) {
+    printf("Backup payload not found...\n");
+    printf("...copy payload to backup location\n");
+    dev->write(dev, (void*)PAYLOAD_DST, BACKUP_SRC, PAYLOAD_SIZE, BOOT0_PART);
+}
+```
+
+- **Primary location**: `PAYLOAD_SRC` (0x80000) in boot0
+- **Backup location**: `BACKUP_SRC` (0x200000) in boot0
+
+## Final Execution
+
+After all modifications, the payload returns control to LK:
+
+```c
+printf("Clean lk\n");
+cache_clean((void*)LK_BASE, LK_SIZE);
+
+printf("Jump lk\n");
+int (*app)() = (void*)0x41E25371;
+app();
+
+while (1) {
+    // Should never reach here
+}
+```
+
+The cache clean ensures all modifications are visible, then execution jumps to LK's main application.
+
+## UART Logging
+
+The payload supports enabling UART output for debugging:
+
+```c
+// UART flag on MISC
+if(strncmp(bootloader_msg + 0x10, "UART_PLEASE", 11) == 0) {
+    // Force uart enable
+    char* disable_uart = (char*)0x41E3A3AB;
+    strcpy(disable_uart, " printk.disable_uart=0");
+}
+```
+
+This modifies the kernel command line to enable UART output.
+
+## Source Code Location
+
+The LK payload implementation can be found at:
+- **Main code**: `lk-payload/main.c`
+- **Common definitions**: `lk-payload/common.h`
+- **Library functions**: `lk-payload/libc.h`
+
+## Features Summary
+
+- **Persistent modifications**: Runs on every boot
+- **Fastboot forcing**: Multiple methods to enter fastboot mode
+- **Device unlock**: Patches bootloader to enable all commands
+- **Boot image manipulation**: Hook system for modifying boot process
+- **GPT parsing**: Automatic partition discovery
+- **MISC partition support**: Boot control via flags
+- **Backup system**: Automatic payload backup to prevent bricking
+- **UART control**: Enable debug output
+
+## Usage Workflow
+
+1. Install [microloader](/reference/microloader) to boot0
+2. Install LK payload to boot0 at `PAYLOAD_SRC` (0x80000)
+3. Reboot device - microloader loads LK payload automatically
+4. LK payload applies patches and modifications
+5. Use MISC partition flags to control boot behavior
+6. Access fastboot mode without button combinations
+
+<Warning>
+Backing up the original boot0 partition is critical before installing the LK payload. A corrupted payload can prevent the device from booting.
+</Warning>

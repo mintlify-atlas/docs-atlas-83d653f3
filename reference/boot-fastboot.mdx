@@ -1,0 +1,238 @@
+---
+title: "boot-fastboot"
+description: "Boot MediaTek device into fastboot mode using preloader handshake"
+---
+
+## Overview
+
+`boot-fastboot.sh` forces a MediaTek device into fastboot mode by sending a special command through the preloader interface. This is useful for accessing fastboot without hardware button combinations.
+
+## Syntax
+
+```bash
+./boot-fastboot.sh
+```
+
+No arguments or options are required.
+
+## Description
+
+The script performs a preloader handshake and sends the `FACTFACT` command, which instructs the device to boot into fastboot mode. This method works when the device is in preloader mode or can be forced into preloader mode.
+
+## Implementation
+
+`boot-fastboot.sh` is a wrapper script that calls the Python handshake module:
+
+```bash boot-fastboot.sh
+#!/bin/bash
+set -e
+cd modules
+python3 handshake2.py FACTFACT
+cd ..
+```
+
+### Handshake Process
+
+The script executes `handshake2.py` with the `FACTFACT` command (`handshake2.py:8-10`):
+
+```python
+def handshake2(dev, cmd='FACTFACT'):
+    log("Handshake")
+    dev.handshake2(cmd)
+```
+
+### Device Communication
+
+The handshake protocol waits for the preloader ready signal and sends the command (`common.py:129-137`):
+
+```python
+def handshake2(self, cmd='FACTFACT'):
+    # look for start byte
+    c = 0
+    while c != b'Y':
+        c = self.dev.read()
+    log("Preloader ready, sending " + cmd)
+    command = str.encode(cmd)
+    self.dev.write(command)
+    self.dev.flushInput()
+```
+
+## Usage
+
+### Basic Usage
+
+Connect your device and run:
+
+```bash
+./boot-fastboot.sh
+```
+
+**Expected output:**
+```
+[INFO] Waiting for device
+[INFO] Found port = /dev/ttyUSB0
+[INFO] Handshake
+[INFO] Preloader ready, sending FACTFACT
+```
+
+The device will then reboot into fastboot mode.
+
+### After Running
+
+Once in fastboot mode, you can use standard fastboot commands:
+
+```bash
+fastboot devices
+fastboot oem unlock
+fastboot flash recovery recovery.img
+fastboot reboot
+```
+
+## Device Detection
+
+The script automatically detects MediaTek devices by:
+
+1. Scanning for USB serial ports with VID `0E8D`
+2. Waiting for a new device to appear if none is connected
+3. Opening serial connection at 115200 baud
+4. Setting 5 second timeout for responses
+
+## Exit Codes
+
+| Code | Description |
+|------|-------------|
+| `0` | Success - FACTFACT command sent to device |
+| Non-zero | Error occurred (device not found, communication failure) |
+
+## Process Flow
+
+<Steps>
+  <Step title="Device Detection">
+    Waits for MediaTek device on USB serial port
+  </Step>
+  <Step title="Preloader Ready">
+    Listens for 'Y' byte indicating preloader is ready
+  </Step>
+  <Step title="Send Command">
+    Transmits FACTFACT command to preloader
+  </Step>
+  <Step title="Device Reboots">
+    Device automatically reboots into fastboot mode
+  </Step>
+</Steps>
+
+## When to Use
+
+Use `boot-fastboot.sh` when you need to:
+
+- Access fastboot without physical button combinations
+- Automate device boot mode switching in scripts
+- Recover a device that won't boot normally
+- Test fastboot functionality during development
+
+<Note>
+  The device must be in preloader mode for this script to work. If your device boots into Android, you may need to use [bootrom-step](/reference/bootrom-step) first to install the custom preloader.
+</Note>
+
+## Troubleshooting
+
+### Device Not Found
+
+**Problem:** Script hangs at "Waiting for device"
+
+**Solutions:**
+- Ensure device is powered off, then connect USB
+- Check USB cable is data-capable (not charge-only)
+- Verify MediaTek USB drivers are installed
+- Try a different USB port
+
+### No Response from Preloader
+
+**Problem:** Script hangs after "Found port"
+
+**Solutions:**
+- Device may not be in preloader mode
+- Disconnect and reconnect USB cable
+- Power cycle the device
+- Check for conflicting serial programs (ModemManager, etc.)
+
+### Permission Denied
+
+**Problem:** Cannot open serial port
+
+**Solutions:**
+```bash
+# Add user to dialout group
+sudo usermod -a -G dialout $USER
+# Log out and back in, or run:
+newgrp dialout
+```
+
+## Comparison with boot-recovery
+
+The main difference between `boot-fastboot.sh` and `boot-recovery.sh` is the command sent to preloader:
+
+| Script | Command | Boot Mode |
+|--------|---------|----------|
+| `boot-fastboot.sh` | `FACTFACT` | Fastboot |
+| `boot-recovery.sh` | `FACTORYM` | Recovery |
+
+## Related Commands
+
+- [boot-recovery](/reference/boot-recovery) - Boot into recovery mode instead
+- [bootrom-step](/reference/bootrom-step) - Full bootrom exploit and preloader installation
+
+## Prerequisites
+
+- Device must be in preloader mode or bootrom mode
+- USB serial drivers must be installed
+- Python 3 with pyserial library
+- Sufficient permissions to access serial ports
+
+## Technical Details
+
+### Serial Configuration
+
+- **Baud rate:** 115200
+- **Timeout:** 5 seconds
+- **VID:** 0E8D (MediaTek)
+- **PID:** 0003 (Bootrom) or other (Preloader)
+
+### Command Protocol
+
+The `FACTFACT` command is an 8-byte ASCII string recognized by MediaTek preloaders:
+
+```
+46 41 43 54 46 41 43 54  (hex)
+F  A  C  T  F  A  C  T   (ASCII)
+```
+
+When received during preloader initialization, it instructs the device to:
+1. Skip normal boot sequence
+2. Initialize USB gadget in fastboot mode
+3. Wait for fastboot commands over USB
+
+## Safety Considerations
+
+<Note>
+  This script only sends a boot mode command and does not modify device partitions or firmware. It is safe to use and can be cancelled at any time.
+</Note>
+
+## Alternative Methods
+
+If this script doesn't work, you can try:
+
+1. **Hardware buttons:** Power + Volume Down (device-specific)
+2. **ADB reboot:** `adb reboot bootloader` (if Android is running)
+3. **Preloader menu:** Some devices have interactive preloader menus
+
+## Integration with Bootrom Exploit
+
+The `bootrom-step.sh` script uses similar logic to force the device into fastboot mode after flashing the microloader (`main.py:102-103`):
+
+```python
+log("Force fastboot")
+force_fastboot(dev, gpt)
+```
+
+This ensures the device boots to fastboot where you can flash additional partitions or unlock the bootloader.

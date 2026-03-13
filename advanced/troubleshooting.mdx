@@ -1,0 +1,430 @@
+---
+title: Troubleshooting
+description: Common issues and solutions when using Kamakiri
+icon: wrench
+---
+
+This guide covers common errors and their solutions when running the Kamakiri exploit.
+
+## Device Detection Issues
+
+<AccordionGroup>
+  <Accordion title="Device not found / No serial port detected">
+    The exploit looks for MediaTek devices with VID `0E8D` and PID `0003`.
+
+    **Symptoms:**
+    - Script hangs at "Waiting for device"
+    - No device appears when connecting via USB
+
+    **Solutions:**
+    1. Verify USB connection is secure
+    2. Try a different USB cable (some cables are charge-only)
+    3. Use a different USB port (preferably USB 2.0)
+    4. Check if device is properly powered and in bootrom mode
+    5. On Linux, verify device appears in `lsusb`:
+    ```bash
+    lsusb | grep 0e8d
+    ```
+  </Accordion>
+
+  <Accordion title="ModemManager conflict">
+    ModemManager will interfere with the serial connection to MediaTek devices.
+
+    **Error message:**
+    ```
+    You need to temporarily disable/uninstall ModemManager before this script can proceed
+    ```
+
+    **Detection code** (from `modules/functions.py:24`):
+    ```python
+    def check_modemmanager():
+        pids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
+        for pid in pids:
+            try:
+                args = open(os.path.join('/proc', pid, 'cmdline'), 'rb').read().decode("utf-8").split('\0')
+                if len(args) > 0 and "modemmanager" in args[0].lower():
+                    print("You need to temporarily disable/uninstall ModemManager before this script can proceed")
+                    sys.exit(1)
+            except IOError:
+                continue
+    ```
+
+    **Solutions:**
+
+    **Ubuntu/Debian:**
+    ```bash
+    sudo systemctl stop ModemManager
+    sudo systemctl disable ModemManager
+    ```
+
+    **Fedora/RHEL:**
+    ```bash
+    sudo systemctl stop ModemManager.service
+    sudo systemctl mask ModemManager.service
+    ```
+
+    **Permanent removal:**
+    ```bash
+    sudo apt remove modemmanager  # Debian/Ubuntu
+    sudo dnf remove ModemManager  # Fedora
+    ```
+
+    <Note>
+    You can re-enable ModemManager after the exploit completes:
+    ```bash
+    sudo systemctl enable ModemManager
+    sudo systemctl start ModemManager
+    ```
+    </Note>
+  </Accordion>
+
+  <Accordion title="Serial port permission denied">
+    **Error message:**
+    ```
+    PermissionError: [Errno 13] Permission denied: '/dev/ttyACM0'
+    ```
+
+    **Solutions:**
+
+    1. Add your user to the `dialout` group:
+    ```bash
+    sudo usermod -a -G dialout $USER
+    ```
+    Then log out and back in.
+
+    2. Temporary fix (single session):
+    ```bash
+    sudo chmod 666 /dev/ttyACM0
+    ```
+
+    3. Run with sudo (not recommended):
+    ```bash
+    sudo python3 modules/main.py
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Payload Loading Errors
+
+<AccordionGroup>
+  <Accordion title="Payload too large">
+    **Error message:**
+    ```python
+    RuntimeError: payload too large
+    ```
+
+    **Cause:**
+    Stage 1 payload exceeds 0xA00 bytes (from `modules/load_payload.py:36`):
+    ```python
+    if len(payload) >= 0xA00:
+        raise RuntimeError("payload too large")
+    ```
+
+    **Solutions:**
+    1. Rebuild payload with optimizations enabled (`-Os` flag)
+    2. Remove debug code and unnecessary functions
+    3. Check linker script memory constraints
+    4. Verify payload binary size:
+    ```bash
+    ls -lh brom-payload/stage1/stage1.bin
+    ```
+  </Accordion>
+
+  <Accordion title="Payload pattern mismatch">
+    **Error message:**
+    ```python
+    RuntimeError: received b'\x00\x00\x00\x00' instead of expected pattern
+    ```
+
+    **Expected patterns:**
+    - Stage 1: `0xA1A2A3A4`
+    - Stage 2: `0xB1B2B3B4`
+
+    **Causes:**
+    - Payload failed to execute correctly
+    - Wrong payload version for device
+    - Corrupted payload binary
+    - Memory address mismatch
+
+    **Solutions:**
+    1. Rebuild payloads from source:
+    ```bash
+    cd brom-payload
+    make clean && make
+    ```
+    2. Verify payload checksums
+    3. Check device compatibility (must be "mantis" - AKPGW064GI9HE)
+    4. Power cycle the device and retry
+  </Accordion>
+
+  <Accordion title="USB control transfer failed">
+    **Error during USB exploit trigger:**
+    ```python
+    usb.core.USBError: [Errno 110] Operation timed out
+    ```
+
+    **Solutions:**
+    1. Install/update pyusb:
+    ```bash
+    pip3 install --upgrade pyusb
+    ```
+    2. Verify USB permissions (udev rules):
+    ```bash
+    echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", MODE="0666"' | sudo tee /etc/udev/rules.d/99-mtk.rules
+    sudo udevadm control --reload-rules
+    ```
+    3. Try a different USB port or hub
+    4. On VM: Ensure USB passthrough is configured correctly
+  </Accordion>
+</AccordionGroup>
+
+## Runtime Errors
+
+<AccordionGroup>
+  <Accordion title="Serial protocol mismatch">
+    **Error message:**
+    ```python
+    RuntimeError: ERROR: Serial protocol mismatch, expected <bytes> got <bytes>
+    ```
+
+    **Cause:**
+    Communication desynchronization between host and device (from `modules/common.py:101`):
+    ```python
+    def check(self, test, gold):
+        if test != gold:
+            raise RuntimeError("ERROR: Serial protocol mismatch, expected {} got {}".format(gold.hex(), test.hex()))
+    ```
+
+    **Solutions:**
+    1. Power cycle the device completely
+    2. Flush serial buffers and retry
+    3. Check for data corruption on USB cable
+    4. Try a lower baud rate (modify `BAUD = 115200` in `common.py`)
+    5. Ensure no other programs are accessing the serial port
+  </Accordion>
+
+  <Accordion title="Wrong device detected">
+    **Error message:**
+    ```
+    Wrong device detected: <device_type_id>
+    ```
+
+    **Cause:**
+    Kamakiri is specifically designed for Amazon Fire tablets with device_type_id `AKPGW064GI9HE` (codename "mantis").
+
+    From `modules/main.py:32`:
+    ```python
+    device_type_id = dev.idme_read(b"device_type_id").rstrip(b"\x00").decode("utf-8")
+    if device_type_id == "AKPGW064GI9HE":
+        log("Detected mantis (" + device_type_id + ")")
+    else:
+        log("Wrong device detected: " + device_type_id)
+        exit(1)
+    ```
+
+    **Solutions:**
+    - Verify you have the correct device model
+    - This exploit will NOT work on other MediaTek devices without modification
+  </Accordion>
+
+  <Accordion title="Device failure during write">
+    **Error message:**
+    ```python
+    RuntimeError: device failure
+    ```
+
+    **Cause:**
+    Device did not return success code `0xD0D0D0D0` after write operation (from `modules/common.py:229`):
+    ```python
+    code = self.dev.read(4)
+    if code != b"\xd0\xd0\xd0\xd0":
+        raise RuntimeError("device failure")
+    ```
+
+    **Solutions:**
+    1. Device may be in unstable state - power cycle completely
+    2. Check for eMMC hardware issues
+    3. Verify watchdog is being kicked regularly
+    4. Review recent write operations for corruption
+  </Accordion>
+</AccordionGroup>
+
+## GPT and Partition Issues
+
+<AccordionGroup>
+  <Accordion title="Bad GPT error">
+    **Error message:**
+    ```python
+    RuntimeError: bad gpt
+    ```
+
+    **Cause:**
+    Required partitions (lk, tee1, boot, recovery) not found in GPT (from `modules/main.py:50`):
+    ```python
+    gpt = parse_gpt(dev)
+    if "lk" not in gpt or "tee1" not in gpt or "boot" not in gpt or "recovery" not in gpt:
+        raise RuntimeError("bad gpt")
+    ```
+
+    **Recovery:**
+    Run the GPT repair mode:
+    ```bash
+    python3 modules/main.py fixgpt
+    ```
+
+    This will restore the partition table from `bin/gpt-mantis.bin`.
+
+    <Warning>
+    GPT repair will write to sector 0-33 of the eMMC. Ensure you have backups before proceeding.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="BOOT0 partition error">
+    **Error message:**
+    ```python
+    RuntimeError: what's wrong with your BOOT0?
+    ```
+
+    **Cause:**
+    BOOT0 partition doesn't start with magic "EMMC_BOOT" (from `modules/functions.py:38`):
+    ```python
+    def switch_boot0(dev):
+        dev.emmc_switch(1)
+        block = dev.emmc_read(0)
+        if block[0:9] != b"EMMC_BOOT" and block != b"\x00" * 0x200:
+            dev.reboot()
+            raise RuntimeError("what's wrong with your BOOT0?")
+    ```
+
+    **Causes:**
+    - BOOT0 partition corrupted
+    - Incomplete previous exploit attempt
+    - eMMC hardware failure
+
+    **Recovery:**
+    Device may need JTAG or ISP recovery if BOOT0 is critically damaged.
+  </Accordion>
+
+  <Accordion title="RPMB looks broken">
+    **Warning message:**
+    ```
+    rpmb looks broken; if this is expected (i.e. you're retrying the exploit) press enter, otherwise terminate with Ctrl+C
+    ```
+
+    **Cause:**
+    RPMB region doesn't start with "AMZN" magic bytes (from `modules/main.py:60`):
+    ```python
+    rpmb = dev.rpmb_read()
+    if rpmb[0:4] != b"AMZN":
+        thread = UserInputThread(msg = "rpmb looks broken...")
+    ```
+
+    **When to continue:**
+    - You're retrying the exploit after a previous attempt
+    - RPMB was already zeroed in a previous run
+
+    **When to stop:**
+    - This is your first attempt
+    - You haven't backed up RPMB data
+    - You're unsure of device state
+
+    <Warning>
+    Once RPMB is zeroed, you cannot restore it. This enables downgrade but is irreversible.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Downgrade failure">
+    **Error message:**
+    ```python
+    RuntimeError: downgrade failure, giving up
+    ```
+
+    **Cause:**
+    RPMB write verification failed (from `modules/main.py:72`):
+    ```python
+    rpmb = dev.rpmb_read()
+    if rpmb != b"\x00" * 0x100:
+        dev.reboot()
+        raise RuntimeError("downgrade failure, giving up")
+    ```
+
+    **Solutions:**
+    1. Power cycle device and retry from beginning
+    2. Verify RPMB region is writable (may be locked on some devices)
+    3. Check for eMMC hardware protection
+    4. Device may require alternative unlock method
+  </Accordion>
+</AccordionGroup>
+
+## Watchdog Issues
+
+<Note>
+The exploit requires periodic watchdog kicks to prevent device reboot during long operations.
+</Note>
+
+**Watchdog kick implementation** (from `modules/common.py:247`):
+```python
+def kick_watchdog(self):
+    # magic
+    self.dev.write(p32_be(0xf00dd00d))
+    # cmd
+    self.dev.write(p32_be(0x3001))
+```
+
+**Symptoms of watchdog timeout:**
+- Unexpected device reboot during operation
+- Script hangs waiting for response
+- Device disconnects from USB
+
+**Prevention:**
+- Watchdog is kicked automatically every ~10 blocks during flash operations
+- Extended operations include explicit kick_watchdog() calls
+- User input prompts include watchdog kick loop
+
+## Recovery Procedures
+
+<Accordion title="Complete device recovery">
+  If the exploit fails and leaves the device in an unstable state:
+
+  1. **Power cycle the device completely:**
+     - Hold power button for 40 seconds
+     - Disconnect and reconnect battery (if accessible)
+
+  2. **Try recovery mode boot:**
+     - Hold Volume Down + Power during boot
+
+  3. **Try fastboot mode:**
+     - Hold Volume Up during boot
+     - Check with: `fastboot devices`
+
+  4. **Re-run exploit in crash mode:**
+     ```bash
+     python3 modules/main.py crash
+     ```
+     This will attempt to crash preloader and return to bootrom.
+
+  5. **GPT repair if accessible:**
+     ```bash
+     python3 modules/main.py fixgpt
+     ```
+
+  <Warning>
+  If device is completely bricked (no USB device detected, no screen output), you may need:
+  - JTAG recovery
+  - eMMC direct programming
+  - Professional repair service
+  </Warning>
+</Accordion>
+
+## Getting Help
+
+If you encounter issues not covered here:
+
+1. Check the source code for error handling logic
+2. Review device logs if accessible via ADB
+3. Search existing issues on the project repository
+4. Provide full error output when reporting issues
+
+<Tip>
+Enable verbose logging by adding print statements in `modules/logger.py` to debug communication issues.
+</Tip>

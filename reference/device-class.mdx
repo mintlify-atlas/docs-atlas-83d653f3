@@ -1,0 +1,391 @@
+---
+title: 'Device Class'
+description: 'Core device communication class for interacting with MediaTek bootrom'
+---
+
+The `Device` class provides low-level serial communication with MediaTek devices in bootrom mode, enabling read/write operations, payload loading, and eMMC manipulation.
+
+## Constructor
+
+```python
+Device(port=None)
+```
+
+Initializes a new Device instance.
+
+<ParamField path="port" type="str" optional>
+  Serial port path (e.g., `/dev/ttyUSB0`). If not provided, use `find_device()` to auto-detect.
+</ParamField>
+
+### Example
+
+```python
+from modules.common import Device
+
+# Auto-detect device
+dev = Device()
+dev.find_device()
+
+# Or specify port directly
+dev = Device('/dev/ttyUSB0')
+```
+
+## Device Discovery
+
+### find_device()
+
+Waits for a MediaTek device to be connected and automatically opens the serial connection.
+
+```python
+dev.find_device()
+```
+
+This method blocks until a device with VID `0E8D` is detected. It monitors serial ports and detects when a new device is added.
+
+<ResponseField name="Sets dev" type="serial.Serial">
+  Opens the serial connection on the detected port
+</ResponseField>
+
+<ResponseField name="Sets preloader" type="bool">
+  `True` if the device is in preloader mode (PID != `0003`), `False` otherwise
+</ResponseField>
+
+## Handshake Methods
+
+### handshake()
+
+Performs the bootrom handshake sequence to establish communication.
+
+```python
+dev.handshake()
+```
+
+Sends the bootrom handshake sequence: `0xa0`, `0x0a`, `0x50`, `0x05` and verifies responses.
+
+### handshake2()
+
+Performs preloader handshake with a custom command.
+
+```python
+dev.handshake2(cmd='FACTFACT')
+```
+
+<ParamField path="cmd" type="str" default="FACTFACT">
+  Command string to send to preloader (default: `'FACTFACT'`)
+</ParamField>
+
+Waits for the preloader to send `'Y'`, then transmits the command string.
+
+## Memory Operations
+
+### read32()
+
+Reads 32-bit words from device memory.
+
+```python
+data = dev.read32(addr, size=1)
+```
+
+<ParamField path="addr" type="int" required>
+  Memory address to read from
+</ParamField>
+
+<ParamField path="size" type="int" default={1}>
+  Number of 32-bit words to read
+</ParamField>
+
+<ResponseField name="return" type="int | list[int]">
+  Single integer if `size=1`, otherwise a list of integers
+</ResponseField>
+
+#### Example
+
+```python
+# Read single word
+value = dev.read32(0x10007000)
+print(f"Value: 0x{value:08X}")
+
+# Read multiple words
+values = dev.read32(0x10007000, size=4)
+for i, val in enumerate(values):
+    print(f"[{i}]: 0x{val:08X}")
+```
+
+### write32()
+
+Writes 32-bit words to device memory.
+
+```python
+dev.write32(addr, words, status_check=True)
+```
+
+<ParamField path="addr" type="int" required>
+  Memory address to write to
+</ParamField>
+
+<ParamField path="words" type="int | list[int]" required>
+  Single word or list of words to write
+</ParamField>
+
+<ParamField path="status_check" type="bool" default={true}>
+  Whether to verify the write operation status
+</ParamField>
+
+#### Example
+
+```python
+# Write single word
+dev.write32(0x10007000, 0x22000000)
+
+# Write multiple words
+dev.write32(0x10007050, [0xA1000, 0x0, 0x0])
+
+# Disable watchdog
+dev.write32(0x10007000, 0x22000000)
+```
+
+## eMMC Operations
+
+### emmc_switch()
+
+Switches between eMMC partitions.
+
+```python
+dev.emmc_switch(part)
+```
+
+<ParamField path="part" type="int" required>
+  Partition number: `0` = user data, `1` = boot0, `2` = boot1
+</ParamField>
+
+### emmc_read()
+
+Reads a 512-byte block from the current eMMC partition.
+
+```python
+data = dev.emmc_read(idx)
+```
+
+<ParamField path="idx" type="int" required>
+  Block index to read
+</ParamField>
+
+<ResponseField name="return" type="bytes">
+  512 bytes of data from the specified block
+</ResponseField>
+
+### emmc_write()
+
+Writes a 512-byte block to the current eMMC partition.
+
+```python
+dev.emmc_write(idx, data)
+```
+
+<ParamField path="idx" type="int" required>
+  Block index to write
+</ParamField>
+
+<ParamField path="data" type="bytes" required>
+  Exactly 512 bytes to write
+</ParamField>
+
+#### Example
+
+```python
+# Switch to boot0 partition
+dev.emmc_switch(1)
+
+# Read first block
+block = dev.emmc_read(0)
+print(f"Header: {block[0:9]}")
+
+# Modify and write back
+modified = bytearray(block)
+modified[0:4] = b"TEST"
+dev.emmc_write(0, bytes(modified))
+```
+
+## RPMB Operations
+
+### rpmb_read()
+
+Reads 256 bytes from the RPMB (Replay Protected Memory Block).
+
+```python
+data = dev.rpmb_read()
+```
+
+<ResponseField name="return" type="bytes">
+  256 bytes of RPMB data
+</ResponseField>
+
+### rpmb_write()
+
+Writes 256 bytes to the RPMB.
+
+```python
+dev.rpmb_write(data)
+```
+
+<ParamField path="data" type="bytes" required>
+  Exactly 256 bytes to write
+</ParamField>
+
+## Advanced Memory Operations
+
+### mem_read()
+
+Reads arbitrary-sized data from device memory (requires stage 2 payload).
+
+```python
+data = dev.mem_read(address, size)
+```
+
+<ParamField path="address" type="int" required>
+  Memory address to read from
+</ParamField>
+
+<ParamField path="size" type="int" required>
+  Number of bytes to read
+</ParamField>
+
+<ResponseField name="return" type="bytes">
+  Raw bytes from the specified memory region
+</ResponseField>
+
+### idme_read()
+
+Reads a field from the IDME (ID Management Engine) data store.
+
+```python
+data = dev.idme_read(field_name)
+```
+
+<ParamField path="field_name" type="bytes" required>
+  Field name to read (max 16 bytes)
+</ParamField>
+
+<ResponseField name="return" type="bytes | None">
+  Field data, or `None` if field not found
+</ResponseField>
+
+#### Example
+
+```python
+# Read serial number from IDME
+serial = dev.idme_read(b"serial")
+if serial:
+    print(f"Serial: {serial.decode('utf-8')}")
+else:
+    print("Serial not found in IDME")
+```
+
+## Payload Loading
+
+### send_da()
+
+Sends a Download Agent (DA) payload to device memory.
+
+```python
+dev.send_da(da_address, da_len, sig_len, da)
+```
+
+<ParamField path="da_address" type="int" required>
+  Target memory address for the payload
+</ParamField>
+
+<ParamField path="da_len" type="int" required>
+  Length of the payload in bytes
+</ParamField>
+
+<ParamField path="sig_len" type="int" required>
+  Signature length (typically `0` for unsigned payloads)
+</ParamField>
+
+<ParamField path="da" type="bytes" required>
+  The payload binary data
+</ParamField>
+
+### jump_da()
+
+Jumps to a loaded Download Agent address.
+
+```python
+dev.jump_da(da_address)
+```
+
+<ParamField path="da_address" type="int" required>
+  Memory address to jump to
+</ParamField>
+
+#### Example
+
+```python
+# Load and execute payload
+payload = open("payload.bin", "rb").read()
+dev.send_da(0x40001000, len(payload), 0, payload)
+dev.jump_da(0x40001000)
+```
+
+### crash_pl()
+
+Crashes the preloader by sending an invalid payload.
+
+```python
+dev.crash_pl()
+```
+
+This is used to force the device back into bootrom mode from preloader.
+
+## System Control
+
+### reboot()
+
+Reboots the device.
+
+```python
+dev.reboot()
+```
+
+Requires stage 2 payload to be loaded. Sends reboot command `0x3000`.
+
+### kick_watchdog()
+
+Kicks the hardware watchdog to prevent device reset.
+
+```python
+dev.kick_watchdog()
+```
+
+Should be called periodically during long operations. Sends command `0x3001`.
+
+## Low-Level I/O
+
+### read()
+
+Reads raw bytes from the serial connection.
+
+```python
+data = dev.read(size=1)
+```
+
+<ParamField path="size" type="int" default={1}>
+  Number of bytes to read
+</ParamField>
+
+### write()
+
+Writes raw data to the serial connection.
+
+```python
+dev.write(data, size=1)
+```
+
+<ParamField path="data" type="bytes | int" required>
+  Data to write (converted to bytes if integer)
+</ParamField>
+
+<ParamField path="size" type="int" default={1}>
+  Size for integer conversion (1, 2, or 4 bytes)
+</ParamField>

@@ -1,0 +1,93 @@
+---
+title: "Introduction"
+description: "Kamakiri is a bootrom exploit tool for MediaTek devices enabling device unlock and custom firmware installation"
+---
+
+## What is Kamakiri?
+
+Kamakiri is a powerful bootrom exploit tool designed for MediaTek-based devices, specifically targeting the Amazon Fire tablet "mantis" series. It enables device unlock, custom firmware installation, and low-level hardware access through a sophisticated multi-stage payload delivery system.
+
+<Warning>
+  This tool performs low-level hardware modifications and can permanently damage your device if used incorrectly. Only use Kamakiri if you fully understand the risks involved.
+</Warning>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Bootrom Exploit" icon="shield-halved">
+    Execute multi-stage bootrom exploits to gain low-level device access
+  </Card>
+  <Card title="eMMC Management" icon="hard-drive">
+    Direct manipulation of eMMC partitions and GPT structures
+  </Card>
+  <Card title="RPMB Downgrade" icon="clock-rotate-left">
+    Downgrade RPMB for firmware rollback capabilities
+  </Card>
+  <Card title="Boot Mode Control" icon="power-off">
+    Force device into fastboot or recovery modes
+  </Card>
+  <Card title="Device Unlock" icon="unlock">
+    Bypass device verification and unlock bootloader
+  </Card>
+  <Card title="Serial Protocol" icon="terminal">
+    Communicate with MediaTek devices via USB serial interface
+  </Card>
+</CardGroup>
+
+## How it works
+
+Kamakiri uses a sophisticated multi-stage approach to exploit MediaTek bootrom vulnerabilities:
+
+<Steps>
+  <Step title="Bootrom Handshake">
+    Establishes serial communication with the device's bootrom via USB
+  </Step>
+  <Step title="Stage 1 Payload">
+    Loads initial exploit payload into bootrom memory
+  </Step>
+  <Step title="Stage 2 Payload">
+    Deploys advanced payload with full eMMC and RPMB access
+  </Step>
+  <Step title="System Modification">
+    Modifies partitions, downgrades firmware, and installs custom bootloader
+  </Step>
+</Steps>
+
+## Supported devices
+
+Currently, Kamakiri supports:
+
+- Amazon Fire HD 8 (2018) - "karnak"
+- Amazon Fire HD 8 (2020) - "mantis"
+
+The tool specifically checks for the device type ID `AKPGW064GI9HE` to ensure compatibility.
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Prerequisites" icon="list-check" href="/prerequisites">
+    Review system requirements and device compatibility
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install dependencies and build payloads
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/usage/quickstart">
+    Execute your first bootrom exploit
+  </Card>
+  <Card title="Safety Warnings" icon="triangle-exclamation" href="/advanced/safety-warnings">
+    Critical safety information before proceeding
+  </Card>
+</CardGroup>
+
+## Architecture overview
+
+Kamakiri consists of several key components:
+
+- **Python modules**: High-level device communication and exploit orchestration
+- **Shell scripts**: Wrapper scripts for common operations (bootrom, fastboot, recovery)
+- **C payloads**: Low-level exploit code that runs on the device (stage1, stage2, lk-payload, microloader)
+- **Binary assets**: Pre-built firmware components (preloader, lk, tz, recovery)
+
+<Note>
+  This project is for educational and research purposes. Users are responsible for compliance with local laws and device warranty implications.
+</Note>

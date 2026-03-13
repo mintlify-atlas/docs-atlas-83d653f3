@@ -1,0 +1,578 @@
+---
+title: 'GPT Operations'
+description: 'Understanding and managing GUID Partition Table (GPT) on MediaTek devices'
+icon: 'hard-drive'
+---
+
+The GUID Partition Table (GPT) is critical for Kamakiri operations. This guide covers GPT structure, reading partitions, and recovery operations.
+
+## Overview
+
+The GPT defines the layout of the eMMC storage on MediaTek devices. Kamakiri needs to read and validate the GPT to:
+
+- Locate bootloader components (lk, tee1, boot, recovery)
+- Find the MISC partition for boot flags
+- Verify partition integrity before flashing
+- Recover from GPT corruption
+
+## GPT Fix Script
+
+### Usage
+
+```bash
+./gpt-fix.sh
+```
+
+Restores the GPT from a backup binary.
+
+### Script Contents
+
+```bash gpt-fix.sh
+#!/bin/bash
+
+set -e
+
+cd modules
+python3 main.py fixgpt
+cd ..
+```
+
+This is equivalent to:
+
+```bash
+./bootrom-step.sh fixgpt
+```
+
+### When to Use
+
+- "bad gpt" error during exploit
+- Missing required partitions (lk, tee1, boot, recovery)
+- Corrupted partition table
+- After experimenting with partition modifications
+
+### What It Does
+
+From modules/main.py:38-41:
+
+```python
+if len(sys.argv) == 2 and sys.argv[1] == "fixgpt":
+    dev.emmc_switch(0)
+    log("Flashing GPT")
+    flash_binary(dev, "../bin/gpt-mantis.bin", 0, 34 * 0x200)
+```
+
+Writes 34 sectors (17,408 bytes) to the beginning of the user partition:
+
+- **Sector 0**: Protective MBR
+- **Sector 1**: GPT Header
+- **Sectors 2-33**: GPT Partition Entry Array (128 entries × 128 bytes each)
+
+<Warning>
+  **This operation is destructive!**
+  
+  - Overwrites existing partition table
+  - Must match your device's actual partition layout
+  - Wrong GPT can make device unbootable
+  - Only works for "mantis" (Fire HD 8) currently
+</Warning>
+
+## Parsing GPT
+
+### The parse_gpt() Function
+
+From modules/functions.py:117-128:
+
+```python
+def parse_gpt(dev):
+    data = dev.emmc_read(0x400 // 0x200) + \
+           dev.emmc_read(0x600 // 0x200) + \
+           dev.emmc_read(0x800 // 0x200) + \
+           dev.emmc_read(0xA00 // 0x200)
+    num = len(data) // 0x80
+    parts = dict()
+    for x in range(num):
+        part = data[x * 0x80:(x + 1) * 0x80]
+        part_name = part[0x38:].decode("utf-16le").rstrip("\x00")
+        part_start = struct.unpack("<Q", part[0x20:0x28])[0]
+        part_end = struct.unpack("<Q", part[0x28:0x30])[0]
+        parts[part_name] = (part_start, part_end - part_start + 1)
+    return parts
+```
+
+### How It Works
+
+<Steps>
+  <Step title="Read Partition Entries">
+    Reads 4 sectors starting at sector 2 (0x400 bytes offset):
+    
+    - Sector 2 (0x400): Entries 0-3
+    - Sector 3 (0x600): Entries 4-7
+    - Sector 4 (0x800): Entries 8-11
+    - Sector 5 (0xA00): Entries 12-15
+    
+    This gives 4×512 = 2048 bytes = 16 partition entries.
+  </Step>
+
+  <Step title="Parse Entry Format">
+    Each 128-byte (0x80) partition entry contains:
+    
+    | Offset | Size | Field | Description |
+    |--------|------|-------|-------------|
+    | 0x00 | 16 | Type GUID | Partition type identifier |
+    | 0x10 | 16 | Partition GUID | Unique partition identifier |
+    | 0x20 | 8 | Start LBA | First sector (little-endian) |
+    | 0x28 | 8 | End LBA | Last sector (little-endian) |
+    | 0x30 | 8 | Attributes | Partition flags |
+    | 0x38 | 72 | Name | UTF-16LE partition name |
+  </Step>
+
+  <Step title="Extract Partition Info">
+    For each entry:
+    ```python
+    part_name = part[0x38:].decode("utf-16le").rstrip("\x00")
+    part_start = struct.unpack("<Q", part[0x20:0x28])[0]
+    part_end = struct.unpack("<Q", part[0x28:0x30])[0]
+    ```
+    
+    Name is at offset 0x38, stored as UTF-16LE.
+    Start and end LBAs are 64-bit little-endian integers.
+  </Step>
+
+  <Step title="Return Dictionary">
+    Returns a dictionary mapping partition names to tuples:
+    ```python
+    {
+        'proinfo': (6144, 6144),    # (start_lba, num_sectors)
+        'lk': (12288, 2048),
+        'tee1': (14336, 1024),
+        'boot': (15360, 32768),
+        'recovery': (48128, 32768),
+        'MISC': (80896, 1024),
+        # ... more partitions
+    }
+    ```
+  </Step>
+</Steps>
+
+### Example Usage
+
+```python
+from common import Device
+from functions import parse_gpt, switch_user
+
+dev = Device()
+dev.find_device()
+switch_user(dev)
+
+gpt = parse_gpt(dev)
+
+print(f"LK partition starts at sector {gpt['lk'][0]}")
+print(f"LK partition size: {gpt['lk'][1]} sectors")
+print(f"LK partition size: {gpt['lk'][1] * 512} bytes")
+
+# Access boot partition
+boot_start, boot_sectors = gpt['boot']
+print(f"Boot: {boot_start} - {boot_start + boot_sectors - 1}")
+```
+
+## Reading Partitions
+
+### Reading Partition Data
+
+Once you have the GPT parsed, you can read partition contents:
+
+```python
+from functions import dump_binary
+
+# Dump entire boot partition to file
+boot_start, boot_size = gpt['boot']
+dump_binary(dev, "boot.img", boot_start, boot_size * 0x200)
+```
+
+The `dump_binary()` function (modules/functions.py:71-79):
+
+```python
+def dump_binary(dev, path, start_block, max_size=0):
+    with open(path, "w+b") as fout:
+        blocks = max_size // 0x200
+        for x in range(blocks):
+            print("[{} / {}]".format(x + 1, blocks), end='\r')
+            fout.write(dev.emmc_read(start_block + x))
+            if x % 10 == 0:
+                dev.kick_watchdog()
+    print("")
+```
+
+### Reading Individual Blocks
+
+For manual operations:
+
+```python
+# Read first block of MISC partition
+misc_start = gpt['MISC'][0]
+misc_block = dev.emmc_read(misc_start)
+
+print("Boot flag:", misc_block[0:16])
+print("Hex dump:", misc_block[0:32].hex())
+```
+
+## Writing Partitions
+
+### Safety Checks
+
+Before writing, Kamakiri performs safety checks:
+
+```python modules/functions.py:36-42
+def switch_boot0(dev):
+    dev.emmc_switch(1)
+    block = dev.emmc_read(0)
+    if block[0:9] != b"EMMC_BOOT" and block != b"\x00" * 0x200:
+        dev.reboot()
+        raise RuntimeError("what's wrong with your BOOT0?")
+    dev.kick_watchdog()
+```
+
+```python modules/functions.py:109-115
+def switch_user(dev):
+    dev.emmc_switch(0)
+    block = dev.emmc_read(0)
+    if block[510:512] != b"\x55\xAA":
+        dev.reboot()
+        raise RuntimeError("what's wrong with your GPT?")
+    dev.kick_watchdog()
+```
+
+### Writing Binary Data
+
+The `flash_binary()` function (modules/functions.py:63-69):
+
+```python
+def flash_binary(dev, path, start_block, max_size=0):
+    with open(path, "rb") as fin:
+        data = fin.read()
+    while len(data) % 0x200 != 0:
+        data += b"\x00"
+    
+    flash_data(dev, data, start_block, max_size=0)
+```
+
+The `flash_data()` function (modules/functions.py:48-61):
+
+```python
+def flash_data(dev, data, start_block, max_size=0):
+    while len(data) % 0x200 != 0:
+        data += b"\x00"
+    
+    if max_size and len(data) > max_size:
+        raise RuntimeError("data too big to flash")
+    
+    blocks = len(data) // 0x200
+    for x in range(blocks):
+        print("[{} / {}]".format(x + 1, blocks), end='\r')
+        dev.emmc_write(start_block + x, data[x * 0x200:(x + 1) * 0x200])
+        if x % 10 == 0:
+            dev.kick_watchdog()
+    print("")
+```
+
+### Example: Flash Custom Boot Image
+
+```python
+from functions import flash_binary, parse_gpt, switch_user
+
+# Ensure we're on user partition
+switch_user(dev)
+
+# Get boot partition location
+gpt = parse_gpt(dev)
+boot_start, boot_size = gpt['boot']
+
+# Flash custom boot image
+flash_binary(dev, "custom_boot.img", boot_start, boot_size * 0x200)
+
+print("Boot image flashed successfully!")
+```
+
+## eMMC Partition Switching
+
+MediaTek eMMC has multiple partitions:
+
+- **Partition 0 (User)**: Main storage, contains GPT and all user partitions
+- **Partition 1 (Boot0)**: Bootrom/preloader, microloader, LK payload
+- **Partition 2 (Boot1)**: Usually unused or backup
+- **RPMB**: Replay Protected Memory Block (special access)
+
+### Switching Partitions
+
+```python
+# Switch to user partition
+dev.emmc_switch(0)
+
+# Switch to boot0
+dev.emmc_switch(1)
+
+# Switch to boot1
+dev.emmc_switch(2)
+```
+
+From modules/common.py:233-239:
+
+```python
+def emmc_switch(self, part):
+    # magic
+    self.dev.write(p32_be(0xf00dd00d))
+    # cmd
+    self.dev.write(p32_be(0x1002))
+    # partition
+    self.dev.write(p32_be(part))
+```
+
+### Partition Layout Example
+
+**Boot0 (Partition 1)**:
+```
+Offset      | Size      | Component
+------------|-----------|-------------------
+0x0         | ~512KB    | Preloader
+0x80000     | variable  | (Reserved)
+0x80000+    | ~100KB    | LK Payload (offset 1024 sectors)
+```
+
+**User (Partition 0)**:
+```
+LBA Range       | Partition  | Size      | Purpose
+----------------|------------|-----------|------------------------
+0 - 1           | -          | 1KB       | Protective MBR
+1 - 33          | -          | 16.5KB    | GPT Header + Entries
+34 - 6143       | -          | ~3MB      | Reserved
+6144 - 12287    | proinfo    | 3MB       | Device info
+12288 - 14335   | lk         | 1MB       | Little Kernel (bootloader)
+14336 - 15359   | tee1       | 512KB     | TrustZone
+15360 - 48127   | boot       | 16MB      | Boot kernel/ramdisk
+48128 - 80895   | recovery   | 16MB      | Recovery kernel/ramdisk
+80896 - 81919   | MISC       | 512KB     | Boot flags, OTA info
+...
+```
+
+## Partition-Specific Operations
+
+### Boot Partition
+
+The boot partition contains:
+- Android boot image header (magic: `ANDROID!`)
+- Kernel
+- Ramdisk
+
+Kamakiri backs up and modifies boot headers:
+
+```python modules/main.py:96-100
+boot_hdr1 = dev.emmc_read(gpt["boot"][0]) + \
+            dev.emmc_read(gpt["boot"][0] + 1)
+boot_hdr2 = dev.emmc_read(gpt["boot"][0] + 2) + \
+            dev.emmc_read(gpt["boot"][0] + 3)
+flash_binary(dev, "../bin/microloader.bin", gpt["boot"][0], 2 * 0x200)
+if boot_hdr2[0:8] != b"ANDROID!":
+    flash_data(dev, boot_hdr1, gpt["boot"][0] + 2, 2 * 0x200)
+```
+
+### MISC Partition
+
+Stores boot control flags (see [Boot Modes](/usage/boot-modes)):
+
+```python
+# Read current boot flags
+misc_start = gpt['MISC'][0]
+misc_data = dev.emmc_read(misc_start)
+boot_command = misc_data[0:16].decode('utf-8', errors='ignore')
+print(f"Current boot command: {boot_command}")
+```
+
+### LK Partition
+
+Contains Little Kernel bootloader. Kamakiri downgrades to vulnerable version:
+
+```python modules/main.py:84-86
+log("Flash lk")
+switch_user(dev)
+flash_binary(dev, "../bin/lk.bin", gpt["lk"][0], gpt["lk"][1] * 0x200)
+```
+
+### TEE1 Partition
+
+TrustZone Execution Environment. Also downgraded:
+
+```python modules/main.py:79-81
+log("Flash tz")
+switch_user(dev)
+flash_binary(dev, "../bin/tz.img", gpt["tee1"][0], gpt["tee1"][1] * 0x200)
+```
+
+## Backup and Recovery
+
+### Creating Backups
+
+Before modifying partitions, create backups:
+
+```python
+from functions import dump_binary, parse_gpt, switch_user, switch_boot0
+
+# Backup GPT
+switch_user(dev)
+dump_binary(dev, "backup_gpt.bin", 0, 34 * 0x200)
+
+# Backup boot partition
+gpt = parse_gpt(dev)
+boot_start, boot_size = gpt['boot']
+dump_binary(dev, "backup_boot.img", boot_start, boot_size * 0x200)
+
+# Backup preloader
+switch_boot0(dev)
+dump_binary(dev, "backup_preloader.bin", 0, 512 * 0x200)
+
+print("Backups created successfully!")
+```
+
+### Restoring from Backup
+
+```python
+from functions import flash_binary, switch_user, switch_boot0
+
+# Restore GPT
+switch_user(dev)
+flash_binary(dev, "backup_gpt.bin", 0, 34 * 0x200)
+
+# Restore boot partition
+gpt = parse_gpt(dev)
+boot_start = gpt['boot'][0]
+flash_binary(dev, "backup_boot.img", boot_start)
+
+# Restore preloader
+switch_boot0(dev)
+flash_binary(dev, "backup_preloader.bin", 0)
+
+print("Restore complete!")
+dev.reboot()
+```
+
+## Risks and Warnings
+
+<Warning>
+  **Critical GPT Risks**
+  
+  - **Corrupted GPT = Bricked Device**: Wrong partition table makes device unbootable
+  - **Boot0 Write Risk**: If power fails during boot0 write, device may be permanently bricked
+  - **No Validation**: Kamakiri assumes binaries in `bin/` are correct for your device
+  - **RPMB Is Permanent**: Cannot restore RPMB after downgrade
+  - **Partition Overlap**: Writing beyond partition boundaries can corrupt adjacent partitions
+</Warning>
+
+### Best Practices
+
+1. **Always Backup First**
+   ```bash
+   # Before any operations
+   python3 backup_script.py
+   ```
+
+2. **Verify Partition Boundaries**
+   ```python
+   # Check partition doesn't overlap
+   start1, size1 = gpt['lk']
+   start2, size2 = gpt['tee1']
+   assert start1 + size1 <= start2, "Partitions overlap!"
+   ```
+
+3. **Size Checks Before Writing**
+   ```python
+   import os
+   file_size = os.path.getsize("image.bin")
+   partition_size = gpt['boot'][1] * 0x200
+   if file_size > partition_size:
+       raise RuntimeError("Image too large!")
+   ```
+
+4. **Stable Power**
+   - Battery >50%
+   - Quality USB cable
+   - No loose connections
+
+5. **Test on Backup Device First**
+   - If possible, test on a spare device
+   - Verify each step completes successfully
+
+## Troubleshooting
+
+### "bad gpt" Error
+
+**Problem**: GPT validation fails
+
+**Solutions**:
+```bash
+# Fix with backup GPT
+./gpt-fix.sh
+
+# Or manually
+./bootrom-step.sh fixgpt
+```
+
+### "what's wrong with your GPT?" Error
+
+**Problem**: MBR signature (0x55AA) missing at end of sector 0
+
+**Causes**:
+- Completely corrupted partition table
+- Wrong eMMC partition selected
+- eMMC hardware failure
+
+**Solutions**:
+- Run gpt-fix.sh
+- Verify eMMC is functioning
+- May need professional recovery
+
+### "data too big to flash" Error
+
+**Problem**: Image file larger than partition
+
+**Solutions**:
+```python
+# Check partition size
+gpt = parse_gpt(dev)
+print(f"Partition size: {gpt['boot'][1] * 512} bytes")
+
+# Check image size
+import os
+print(f"Image size: {os.path.getsize('boot.img')} bytes")
+
+# Use correct image or resize partition (advanced)
+```
+
+### Watchdog Reboot During Flash
+
+**Problem**: Device reboots mid-operation
+
+**Causes**:
+- Watchdog not kicked frequently enough
+- Operation taking too long
+- USB connection interrupted
+
+**Solutions**:
+- Check USB cable quality
+- Use USB 2.0 port (not USB 3.0/hub)
+- Modify code to kick watchdog more frequently
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Bootrom Exploit" icon="shield-halved" href="/usage/bootrom-exploit">
+    How GPT is used during exploitation
+  </Card>
+  <Card title="Functions Module" icon="code" href="/reference/functions">
+    Complete API reference for GPT functions
+  </Card>
+  <Card title="Boot Modes" icon="power-off" href="/usage/boot-modes">
+    MISC partition boot flag operations
+  </Card>
+  <Card title="Device Class" icon="microchip" href="/reference/device-class">
+    Low-level eMMC read/write operations
+  </Card>
+</CardGroup>

@@ -1,0 +1,348 @@
+---
+title: Stage 2 Payload
+description: Second-stage payload with full eMMC access and extended command set
+---
+
+## Overview
+
+The Stage 2 payload is loaded and executed by [Stage 1](/reference/stage1-payload) after the initial bootrom exploit. It provides full eMMC access, RPMB operations, and an extended command set for reading, writing, and manipulating the device's storage.
+
+## Memory Layout
+
+The Stage 2 payload is loaded at a different memory address than Stage 1:
+
+```ld
+. = 0x201000;
+```
+
+This location provides more space for the larger Stage 2 payload, which includes eMMC drivers and additional functionality.
+
+## Initialization
+
+Stage 2 performs critical hardware initialization before entering the command loop:
+
+```c
+int main() {
+    printf("Entered 2ND stage payload\n");
+    printf("Copyright xyz, k4y0z 2019\n");
+
+    struct msdc_host host = { 0 };
+    host.ocr_avail = MSDC_OCR_AVAIL;
+
+    mmc_init(&host);
+
+    command_loop(&host);
+}
+```
+
+### Key Initialization Steps
+
+1. **Initialize host structure**: Sets up the `msdc_host` structure for eMMC controller
+2. **Set OCR register**: Configures operating conditions register (`MSDC_OCR_AVAIL`)
+3. **Initialize MMC/eMMC**: Calls `mmc_init()` to detect and configure the eMMC device
+4. **Enter command loop**: Begins processing commands from the host
+
+<Note>
+Stage 2 has full `printf()` support, unlike Stage 1 which only has basic `print()`.
+</Note>
+
+## Protocol
+
+Stage 2 uses the same protocol format as Stage 1 but with different magic values:
+
+### Message Format
+
+1. **Magic Header**: `0xf00dd00d` (validates each command)
+2. **Command Code**: 32-bit command identifier
+3. **Command-specific data**: Parameters based on command type
+
+### Ready Signal
+
+When Stage 2 is ready to receive commands, it sends:
+
+```c
+send_dword(0xB1B2B3B4);
+```
+
+<Warning>
+Note the different magic value: Stage 1 uses `0xA1A2A3A4`, while Stage 2 uses `0xB1B2B3B4`.
+</Warning>
+
+## Command Set
+
+Stage 2 provides an extensive command set for eMMC operations:
+
+### Storage Commands
+
+#### 0x1000 - Read Block
+
+Reads a 512-byte block from eMMC.
+
+**Parameters:**
+- `block` (uint32_t): Block number to read
+
+**Response:**
+- 512 bytes of block data
+
+```c
+case 0x1000: {
+    uint32_t block = recv_dword();
+    printf("Read block 0x%08X\n", block);
+    memset(buf, 0, sizeof(buf));
+    if (mmc_read(host, block, buf) != 0) {
+        printf("Read error!\n");
+    } else {
+        send_data(buf, sizeof(buf));
+    }
+    break;
+}
+```
+
+#### 0x1001 - Write Block
+
+Writes a 512-byte block to eMMC.
+
+**Parameters:**
+- `block` (uint32_t): Block number to write
+- `data` (512 bytes): Block data to write
+
+**Response:**
+- `0xD0D0D0D0`: Success
+
+```c
+case 0x1001: {
+    uint32_t block = recv_dword();
+    printf("Write block 0x%08X ", block);
+    memset(buf, 0, sizeof(buf));
+    recv_data(buf, 0x200, 0);
+    if (mmc_write(host, block, buf) != 0) {
+        printf("Write error!\n");
+    } else {
+        printf("OK\n");
+        send_dword(0xD0D0D0D0);
+    }
+    break;
+}
+```
+
+#### 0x1002 - Switch Partition
+
+Switches to a different eMMC partition (boot0, boot1, or user).
+
+**Parameters:**
+- `part` (uint32_t): Partition number (1=boot0, 2=boot1, 8=user)
+
+```c
+case 0x1002: {
+    uint32_t part = recv_dword();
+    printf("Switch to partition %d => ", part);
+    ret = mmc_set_part(host, part);
+    printf("0x%08X\n", ret);
+    mdelay(500); // just in case
+    break;
+}
+```
+
+<Accordion title="Partition Numbers">
+- **1**: boot0 partition
+- **2**: boot1 partition  
+- **8**: user (main) partition
+</Accordion>
+
+### RPMB Commands
+
+#### 0x2000 - Read RPMB
+
+Reads data from the Replay Protected Memory Block.
+
+**Parameters:** None
+
+**Response:**
+- 256 bytes of RPMB data
+
+```c
+case 0x2000: {
+    printf("Read rpmb\n");
+    mmc_rpmb_read(host, buf);
+    send_data(buf, 0x100);
+    break;
+}
+```
+
+#### 0x2001 - Write RPMB
+
+Writes data to the Replay Protected Memory Block.
+
+**Parameters:**
+- `data` (256 bytes): RPMB data to write
+
+```c
+case 0x2001: {
+    printf("Write rpmb\n");
+    recv_data(buf, 0x100, 0);
+    mmc_rpmb_write(host, buf);
+    break;
+}
+```
+
+<Warning>
+RPMB operations require proper authentication. Incorrect operations may permanently lock the RPMB partition.
+</Warning>
+
+### Memory Commands
+
+#### 0x5000 - Read Memory
+
+Reads arbitrary memory from the device.
+
+**Parameters:**
+- `address` (uint32_t): Memory address to read from
+- `size` (uint32_t): Number of bytes to read
+
+**Response:**
+- Raw bytes from memory
+
+```c
+case 0x5000: {
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    printf("Read %d Bytes from address 0x%08X\n", size, address);
+    send_data((char*)address, size);
+    break;
+}
+```
+
+### IDME Commands
+
+#### 0x7000 - Read IDME Field
+
+Reads a specific field from Amazon's IDME (ID ME) partition.
+
+**Parameters:**
+- `field_name` (16 bytes): Name of IDME field to read
+
+**Response:**
+- `length` (uint32_t): Field data length
+- `data`: Field data (variable length)
+
+```c
+case 0x7000: {
+    char idme_buf[0x400] = { 0 };
+    char field_name[16] = { 0 };
+    const char beefdeed[] = "beefdeed";
+    uint32_t result = 0;
+    recv_data(field_name, 16, 0);
+    printf("Read %s from IDME\n", field_name);
+    
+    // Switch to boot1 partition where IDME is stored
+    printf("Switch to partition %d => ", 2);
+    ret = mmc_set_part(host, 2);
+    printf("0x%08X\n", ret);
+    mdelay(500);
+    
+    // Search for field in IDME partition...
+    // (see full implementation in payload_common.c:112-172)
+}
+```
+
+<Accordion title="IDME Partition Structure">
+The IDME partition stores device-specific information:
+- **Magic**: `beefdeed` at start of partition
+- **Fields**: Type-Length-Value (TLV) format
+- **Field header**: 16-byte type name + 12-byte metadata + 4-byte length
+- **Location**: Stored in boot1 partition (partition 2)
+</Accordion>
+
+### System Commands
+
+#### 0x3000 - Reboot Device
+
+Triggers a hardware reset using the watchdog timer.
+
+**Parameters:** None
+
+```c
+case 0x3000: {
+    printf("Reboot\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;
+    reg[0/4] = 0x22000014;
+    reg[0x14/4] = 0x1209;
+
+    while (1) {
+        // Wait for reset
+    }
+}
+```
+
+#### 0x3001 - Kick Watchdog
+
+Resets the watchdog timer to prevent automatic reboot.
+
+**Parameters:** None
+
+```c
+case 0x3001: {
+    printf("Kick watchdog\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;
+    break;
+}
+```
+
+## Error Responses
+
+The Stage 2 payload uses specific error codes:
+
+- **0xD0D0D0D0**: Success (write operations)
+- **0xDEADBEEF**: IDME field not found
+- **0xBEEFDEED**: IDME partition invalid
+- **0xFFFFFFFF**: Read error during IDME search
+
+## Usage Example
+
+<Accordion title="Reading Boot Partition">
+```python
+# Wait for Stage 2 ready signal
+magic = device.recv_dword()
+assert magic == 0xB1B2B3B4
+
+# Switch to boot0 partition
+device.send_dword(0xf00dd00d)  # Protocol magic
+device.send_dword(0x1002)       # Switch partition command
+device.send_dword(1)            # boot0 = partition 1
+
+# Read first block of boot0
+device.send_dword(0xf00dd00d)  # Protocol magic
+device.send_dword(0x1000)       # Read block command
+device.send_dword(0)            # Block 0
+boot_block = device.recv_data(512)
+
+print(f"Boot0 first block: {boot_block.hex()}")
+```
+</Accordion>
+
+## Source Code Location
+
+The Stage 2 payload implementation can be found at:
+- **Main code**: `brom-payload/stage2.c`
+- **Command loop**: `brom-payload/payload_common.c`
+- **Linker script**: `brom-payload/stage2.ld`
+- **Headers**: `brom-payload/payload_common.h`
+- **MMC drivers**: `brom-payload/drivers/`
+
+## Advantages Over Stage 1
+
+- **Full eMMC access**: Read/write to all partitions
+- **RPMB operations**: Access to secure storage
+- **Printf support**: Better debugging output
+- **IDME parsing**: Read device-specific data
+- **More memory**: Larger payload size allowed
+
+## Next Steps
+
+After Stage 2 is running:
+1. Read and backup critical partitions
+2. Write modified bootloader or [microloader](/reference/microloader)
+3. Install [LK payload](/reference/lk-payload) for persistent modifications
+4. Perform device unlock or other modifications

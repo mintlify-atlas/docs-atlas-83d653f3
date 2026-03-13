@@ -1,0 +1,169 @@
+---
+title: 'Architecture Overview'
+description: 'High-level overview of Kamakiri exploit architecture and component relationships'
+---
+
+## System Architecture
+
+Kamakiri is a multi-stage bootrom exploit tool for MediaTek devices that establishes full control over the device by exploiting vulnerabilities in the BootROM and injecting custom payloads at various boot stages.
+
+### Component Hierarchy
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Host PC (Python)                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │   common.py  │  │load_payload  │  │    main.py   │ │
+│  │ (Device API) │  │    .py       │  │              │ │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘ │
+│         │                  │                  │         │
+│         └──────────────────┴──────────────────┘         │
+│                         USB/Serial                      │
+└────────────────────────────┬────────────────────────────┘
+                             │
+┌────────────────────────────┴────────────────────────────┐
+│                   MediaTek Device                       │
+│  ┌────────────────────────────────────────────────────┐│
+│  │  BootROM → Stage 1 → Stage 2 → Microloader → LK   ││
+│  │                                                     ││
+│  │  0x100A00  0x201000  eMMC       Preloader   LK    ││
+│  └────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+<AccordionGroup>
+  <Accordion title="Host-Side Components" icon="computer">
+    - **Device class** (`modules/common.py`) - Provides high-level API for device communication
+    - **Payload loader** (`modules/load_payload.py`) - Handles exploit delivery and payload injection
+    - **Main scripts** - User-facing tools for various operations (dump, flash, etc.)
+  </Accordion>
+
+  <Accordion title="Device-Side Payloads" icon="microchip">
+    - **Stage 1** (`brom-payload/stage1.c`) - Initial exploit payload, basic command loop
+    - **Stage 2** (`brom-payload/stage2.c`) - Full eMMC access and advanced operations
+    - **Microloader** (`microloader/main.c`) - Persistent boot-time payload loader
+    - **LK Payload** (`lk-payload/main.c`) - Little Kernel hooks for boot manipulation
+  </Accordion>
+</AccordionGroup>
+
+## Data Flow
+
+The exploit follows a carefully orchestrated sequence:
+
+### 1. Initial Connection
+
+```python
+# Host PC initiates handshake
+dev = Device()
+dev.find_device()
+dev.handshake()
+```
+
+The device is detected via USB (VID: `0x0E8D`, PID: `0x0003`) and a 4-byte handshake sequence establishes communication with the BootROM.
+
+### 2. Exploit Delivery
+
+<Steps>
+  <Step title="Disable Watchdog">
+    Write `0x22000000` to `0x10007000` to prevent device reset during exploit
+  </Step>
+  
+  <Step title="Trigger Vulnerability">
+    Exploit memory corruption vulnerability to redirect execution to attacker-controlled memory
+  </Step>
+  
+  <Step title="Load Stage 1">
+    Inject stage1.bin (< 0xA00 bytes) at address `0x100A00`
+  </Step>
+  
+  <Step title="Execute Stage 1">
+    USB control transfer triggers execution of stage 1 payload
+  </Step>
+</Steps>
+
+### 3. Multi-Stage Payload Execution
+
+Once stage 1 is running, it provides a command interface to:
+- Write arbitrary memory (`0x4000`)
+- Jump to arbitrary code (`0x4001`)
+- Load stage 2 for full eMMC access
+- Kick watchdog to prevent timeout (`0x3001`)
+
+### 4. Persistent Access
+
+The microloader is injected into the eMMC boot0 partition, allowing automatic payload loading on every boot without requiring the exploit to be re-run.
+
+## Memory Layout
+
+<Note>
+These addresses are specific to MediaTek MT8127/MT8163 (Karnak) devices.
+</Note>
+
+| Address | Purpose |
+|---------|--------|
+| `0x100A00` | Stage 1 payload injection point |
+| `0x201000` | Stage 2 payload location |
+| `0x10007000` | Watchdog timer base |
+| `0x10210000` | Crypto engine base |
+| `0x40001000` | Preloader payload location |
+| `0x41E00000` | LK base address |
+| `0x11003000` | UART base for debug output |
+
+## Key Modules
+
+### Device Communication (`modules/common.py`)
+
+Provides the primary interface for all device operations:
+
+```python
+class Device:
+    def handshake()          # Initial BootROM handshake
+    def read32(addr, size)   # Read memory (32-bit words)
+    def write32(addr, words) # Write memory (32-bit words)
+    def emmc_read(idx)       # Read eMMC block
+    def emmc_write(idx, data)# Write eMMC block
+    def emmc_switch(part)    # Switch eMMC partition
+    def kick_watchdog()      # Prevent device reset
+```
+
+See [Device Communication](./device-communication) for protocol details.
+
+### Payload System
+
+Each payload stage builds upon the previous one:
+
+- **Stage 1**: Minimal command loop for memory access
+- **Stage 2**: eMMC driver for storage operations
+- **Microloader**: Automatic payload loading on boot
+- **LK Payload**: Boot process manipulation and unlock
+
+See [Payload System](./payload-system) for implementation details.
+
+## Security Considerations
+
+<Warning>
+This exploit provides **complete control** over the device, including:
+- Reading/writing any memory location
+- Full eMMC access (including boot partitions)
+- RPMB access for secure storage
+- Boot process manipulation
+</Warning>
+
+The exploit bypasses:
+- Secure boot verification
+- Bootloader lock status
+- Device-specific restrictions
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Payload System" icon="layer-group" href="./payload-system">
+    Learn about the multi-stage payload architecture
+  </Card>
+  
+  <Card title="Device Communication" icon="tower-broadcast" href="./device-communication">
+    Understand the serial protocol and command structure
+  </Card>
+</CardGroup>

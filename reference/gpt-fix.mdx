@@ -1,0 +1,343 @@
+---
+title: "gpt-fix"
+description: "Standalone utility to repair corrupted GPT partition tables on MediaTek devices"
+---
+
+## Overview
+
+`gpt-fix.sh` is a standalone utility that repairs corrupted GUID Partition Table (GPT) structures on MediaTek devices. It flashes a known-good GPT layout to restore critical partitions needed for device boot and exploitation.
+
+## Syntax
+
+```bash
+./gpt-fix.sh
+```
+
+No arguments or options are required.
+
+## Description
+
+The script loads the bootrom exploit payload to gain eMMC access, then flashes a pre-built GPT structure from `bin/gpt-mantis.bin` to the first 34 sectors of the eMMC user partition. This restores the partition table to a known-good state.
+
+<Warning>
+  This script will overwrite your existing partition table. All partition layout information will be replaced. Data in partitions themselves is not affected, but partition boundaries and names will be reset.
+</Warning>
+
+## Implementation
+
+`gpt-fix.sh` is a wrapper script that calls the Python main module in fixgpt mode:
+
+```bash gpt-fix.sh
+#!/bin/bash
+set -e
+cd modules
+python3 main.py fixgpt
+cd ..
+```
+
+### GPT Fix Logic
+
+The fixgpt mode is handled in `main.py` (`main.py:38-41`):
+
+```python
+if len(sys.argv) == 2 and sys.argv[1] == "fixgpt":
+    dev.emmc_switch(0)
+    log("Flashing GPT")
+    flash_binary(dev, "../bin/gpt-mantis.bin", 0, 34 * 0x200)
+```
+
+### eMMC Switch
+
+Before flashing, the script switches to eMMC partition 0 (user data area):
+
+```python
+def emmc_switch(self, part):
+    # magic
+    self.dev.write(p32_be(0xf00dd00d))
+    # cmd
+    self.dev.write(p32_be(0x1002))
+    # partition
+    self.dev.write(p32_be(part))
+```
+
+### GPT Flashing
+
+The GPT is flashed to the first 34 sectors (17,408 bytes):
+
+- **Sector 0:** Protective MBR
+- **Sector 1:** Primary GPT Header
+- **Sectors 2-33:** GPT Partition Entry Array
+
+## When to Use
+
+Use `gpt-fix.sh` when:
+
+- Device fails GPT validation during `bootrom-step.sh`
+- Partition table is corrupted due to interrupted operations
+- Critical partitions (lk, tee1, boot, recovery) are missing
+- You need to restore factory partition layout
+- Device won't boot due to partition errors
+
+<Note>
+  If `bootrom-step.sh` fails with "bad gpt" error, run `gpt-fix.sh` first, then retry the exploit.
+</Note>
+
+## Usage
+
+### Basic Usage
+
+Connect your device in bootrom mode and run:
+
+```bash
+./gpt-fix.sh
+```
+
+**Expected output:**
+```
+[INFO] Waiting for device
+[INFO] Found port = /dev/ttyUSB0
+[INFO] Handshake
+[INFO] Load payload
+[INFO] Check device_type_id
+[INFO] Detected mantis (AKPGW064GI9HE)
+[INFO] Flashing GPT
+[INFO] Done
+```
+
+### After Running
+
+After GPT fix completes, you can:
+
+1. Verify the partition layout:
+```bash
+# If you have fastboot access
+fastboot getvar all
+```
+
+2. Continue with the full exploit:
+```bash
+./bootrom-step.sh
+```
+
+## Exit Codes
+
+| Code | Description |
+|------|-------------|
+| `0` | Success - GPT restored |
+| `1` | Device type mismatch |
+| Non-zero | Error during payload loading or flashing |
+
+## Process Flow
+
+<Steps>
+  <Step title="Device Connection">
+    Waits for MediaTek device in bootrom mode
+  </Step>
+  <Step title="Payload Loading">
+    Loads exploit payload to gain eMMC access
+  </Step>
+  <Step title="Device Verification">
+    Checks device type ID matches mantis
+  </Step>
+  <Step title="Switch to User Partition">
+    Switches eMMC to partition 0 (main storage)
+  </Step>
+  <Step title="Flash GPT">
+    Writes 34 sectors from gpt-mantis.bin to sector 0
+  </Step>
+</Steps>
+
+## GPT Structure
+
+The restored GPT includes these critical partitions:
+
+| Partition | Purpose | Required By |
+|-----------|---------|-------------|
+| `preloader` | First stage bootloader | Boot process |
+| `lk` | Little Kernel (bootloader) | System boot |
+| `tee1` | TrustZone firmware | Secure boot |
+| `boot` | Android boot image | Normal boot |
+| `recovery` | Recovery image | Recovery mode |
+| `system` | Android system | OS |
+| `vendor` | Vendor partition | OS |
+| `userdata` | User data | OS |
+
+### Validation
+
+After GPT fix, the exploit validates these partitions exist (`main.py:44-51`):
+
+```python
+log("Check GPT")
+switch_user(dev)
+gpt = parse_gpt(dev)
+log("gpt_parsed = {}".format(gpt))
+if "lk" not in gpt or "tee1" not in gpt or "boot" not in gpt or "recovery" not in gpt:
+    raise RuntimeError("bad gpt")
+```
+
+## Comparison with bootrom-step fixgpt
+
+Both methods fix the GPT, but differ in when they run:
+
+| Method | Command | When to Use |
+|--------|---------|-------------|
+| `gpt-fix.sh` | Standalone | Fix GPT only, then exit |
+| `bootrom-step.sh fixgpt` | Integrated | Fix GPT, then continue full exploit |
+
+### Standalone GPT Fix
+
+```bash
+./gpt-fix.sh
+# Exits after fixing GPT
+```
+
+### Integrated GPT Fix
+
+```bash
+./bootrom-step.sh fixgpt
+# Fixes GPT, then continues with:
+# - GPT validation
+# - RPMB downgrade  
+# - Firmware flashing
+# - Preloader installation
+# - Device reboot
+```
+
+<Note>
+  Use standalone `gpt-fix.sh` if you only need to repair the partition table. Use `bootrom-step.sh fixgpt` if you want to fix GPT and complete the full exploit in one operation.
+</Note>
+
+## Troubleshooting
+
+### Device Type Mismatch
+
+**Problem:** "Wrong device detected" error
+
+**Solution:** This script only supports mantis devices (AKPGW064GI9HE). Verify your device model.
+
+### Payload Load Failure
+
+**Problem:** Script fails during "Load payload" stage
+
+**Solutions:**
+- Ensure device is in bootrom mode (not preloader)
+- Check that payload files exist in `modules/` directory
+- Verify USB connection is stable
+- Try a different USB port or cable
+
+### Flash Failure
+
+**Problem:** Error during "Flashing GPT" stage
+
+**Solutions:**
+- Verify `bin/gpt-mantis.bin` exists and is valid
+- Check device has sufficient battery (>50%)
+- Ensure eMMC is not hardware-damaged
+- Try running the script again
+
+### Still Bad GPT After Fix
+
+**Problem:** `bootrom-step.sh` still reports "bad gpt" after fix
+
+**Solutions:**
+- Run `gpt-fix.sh` a second time to ensure write completed
+- Check if eMMC hardware is failing
+- Verify you're using the correct GPT binary for your device
+
+## Prerequisites
+
+- Device must be in bootrom mode
+- USB serial drivers installed
+- Python 3 with pyserial
+- `bin/gpt-mantis.bin` must exist
+- Payload modules must be built
+- Sufficient permissions for serial port access
+
+## Related Commands
+
+- [bootrom-step](/reference/bootrom-step) - Full exploit with integrated GPT fix option
+
+## Technical Details
+
+### GPT Binary Location
+
+```
+bin/gpt-mantis.bin
+```
+
+This file contains:
+- **Size:** 17,408 bytes (34 sectors × 512 bytes)
+- **Content:** Protective MBR + GPT Header + Partition Entries
+- **Device:** Mantis (Amazon Fire HD 8 2020)
+
+### eMMC Partitions
+
+MediaTek eMMC has multiple hardware partitions:
+
+| Partition ID | Name | Purpose |
+|--------------|------|----------|
+| 0 | User | Main storage with GPT |
+| 1 | Boot0 | Preloader and lk-payload |
+| 2 | Boot1 | Unused |
+| 3 | RPMB | Replay Protected Memory Block |
+
+GPT is stored on partition 0 (user data area).
+
+### Flash Operation
+
+The GPT is written sector-by-sector via the payload's eMMC write command (`common.py:216-231`):
+
+```python
+def emmc_write(self, idx, data):
+    if len(data) != 0x200:
+        raise RuntimeError("data must be 0x200 bytes")
+    
+    # magic
+    self.dev.write(p32_be(0xf00dd00d))
+    # cmd  
+    self.dev.write(p32_be(0x1001))
+    # block to write
+    self.dev.write(p32_be(idx))
+    # data
+    self.dev.write(data)
+    
+    code = self.dev.read(4)
+    if code != b"\xd0\xd0\xd0\xd0":
+        raise RuntimeError("device failure")
+```
+
+Each 512-byte sector is sent with a magic header, command code, block index, and data payload.
+
+## Safety Considerations
+
+<Warning>
+  - GPT fix overwrites partition table metadata
+  - Partition data itself is not affected
+  - Device must not lose power during GPT flash
+  - Incorrect GPT binary can make device unbootable
+  - Always use the correct GPT file for your device model
+</Warning>
+
+## Recovery
+
+If GPT fix fails partway through:
+
+1. **Power cycle device** - Turn off and disconnect USB
+2. **Retry GPT fix** - Run `gpt-fix.sh` again
+3. **Check device** - If device still boots to preloader, GPT is likely intact
+4. **Last resort** - If device is bricked, you may need EDL/JTAG recovery
+
+<Note>
+  The GPT fix operation is atomic per sector. If interrupted, only some sectors may be written, but you can safely retry to complete the operation.
+</Note>
+
+## Alternative Approach
+
+You can also fix GPT as part of the full exploit:
+
+```bash
+# Fix GPT and continue with full exploit
+./bootrom-step.sh fixgpt
+```
+
+This is recommended if you want to exploit the device immediately after fixing the partition table.

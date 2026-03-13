@@ -1,0 +1,497 @@
+---
+title: 'Utility Functions'
+description: 'Helper functions for eMMC operations, GPT parsing, and device management'
+---
+
+The `functions` module provides high-level utility functions for common device operations like partition switching, flashing binaries, and GPT manipulation.
+
+## Partition Switching
+
+### switch_user()
+
+Switches to the eMMC user data partition and verifies GPT.
+
+```python
+from modules.functions import switch_user
+
+switch_user(dev)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance with loaded payload
+</ParamField>
+
+This function:
+- Switches to partition 0 (user data)
+- Reads block 0 and verifies GPT signature (`0x55AA`)
+- Kicks watchdog to prevent reset
+- Raises `RuntimeError` if GPT is invalid
+
+### switch_boot0()
+
+Switches to the eMMC boot0 partition and verifies header.
+
+```python
+from modules.functions import switch_boot0
+
+switch_boot0(dev)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance
+</ParamField>
+
+Verifies the first block contains either:
+- `EMMC_BOOT` header (standard MediaTek boot partition)
+- All zeros (empty boot partition)
+
+Raises `RuntimeError` if validation fails and reboots the device.
+
+### switch_boot1()
+
+Switches to the eMMC boot1 partition.
+
+```python
+from modules.functions import switch_boot1
+
+switch_boot1(dev)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance
+</ParamField>
+
+Simply switches to partition 2 (boot1) and kicks the watchdog.
+
+#### Example
+
+```python
+# Examine all eMMC partitions
+switch_boot0(dev)
+boot0_header = dev.emmc_read(0)
+print(f"Boot0: {boot0_header[0:9]}")
+
+switch_boot1(dev)
+boot1_header = dev.emmc_read(0)
+print(f"Boot1: {boot1_header[0:9]}")
+
+switch_user(dev)
+gpt = dev.emmc_read(0)
+print(f"GPT sig: {gpt[510:512].hex()}")
+```
+
+## Flashing and Dumping
+
+### flash_binary()
+
+Flashes a binary file to eMMC at a specific block address.
+
+```python
+from modules.functions import flash_binary
+
+flash_binary(dev, path, start_block, max_size=0)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance
+</ParamField>
+
+<ParamField path="path" type="str" required>
+  Path to the binary file to flash
+</ParamField>
+
+<ParamField path="start_block" type="int" required>
+  Starting block index (512 bytes per block)
+</ParamField>
+
+<ParamField path="max_size" type="int" default={0}>
+  Maximum size in bytes (0 = no limit). Raises error if file exceeds this.
+</ParamField>
+
+The file is automatically padded to 512-byte alignment. Progress is displayed as `[current / total]`.
+
+#### Example
+
+```python
+from modules.functions import switch_boot0, flash_binary, parse_gpt
+
+# Flash custom preloader to boot0
+switch_boot0(dev)
+flash_binary(dev, "preloader_custom.bin", start_block=0)
+
+# Flash recovery image to RECOVERY partition
+switch_user(dev)
+gpt = parse_gpt(dev)
+flash_binary(dev, "recovery.img", start_block=gpt["RECOVERY"][0])
+```
+
+### flash_data()
+
+Flashes raw bytes to eMMC.
+
+```python
+from modules.functions import flash_data
+
+flash_data(dev, data, start_block, max_size=0)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance
+</ParamField>
+
+<ParamField path="data" type="bytes" required>
+  Raw data to flash (automatically padded to 512 bytes)
+</ParamField>
+
+<ParamField path="start_block" type="int" required>
+  Starting block index
+</ParamField>
+
+<ParamField path="max_size" type="int" default={0}>
+  Maximum size in bytes (0 = no limit)
+</ParamField>
+
+#### Example
+
+```python
+# Create and flash custom data
+custom_data = b"CUSTOM_HEADER" + b"\x00" * 500
+flash_data(dev, custom_data, start_block=100)
+```
+
+### dump_binary()
+
+Dumps eMMC data to a binary file.
+
+```python
+from modules.functions import dump_binary
+
+dump_binary(dev, path, start_block, max_size)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance
+</ParamField>
+
+<ParamField path="path" type="str" required>
+  Output file path
+</ParamField>
+
+<ParamField path="start_block" type="int" required>
+  Starting block index
+</ParamField>
+
+<ParamField path="max_size" type="int" required>
+  Number of bytes to dump
+</ParamField>
+
+#### Example
+
+```python
+from modules.functions import switch_boot0, dump_binary, parse_gpt
+
+# Dump entire boot0 partition (4MB)
+switch_boot0(dev)
+dump_binary(dev, "boot0_backup.bin", start_block=0, max_size=4*1024*1024)
+
+# Dump RECOVERY partition
+switch_user(dev)
+gpt = parse_gpt(dev)
+recovery_start, recovery_size = gpt["RECOVERY"]
+dump_binary(dev, "recovery_backup.img", 
+            start_block=recovery_start,
+            max_size=recovery_size * 512)
+```
+
+## GPT Parsing
+
+### parse_gpt()
+
+Parses the GPT (GUID Partition Table) and returns partition information.
+
+```python
+from modules.functions import parse_gpt
+
+gpt = parse_gpt(dev)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance (must be on user partition)
+</ParamField>
+
+<ResponseField name="return" type="dict[str, tuple[int, int]]">
+  Dictionary mapping partition names to `(start_block, num_blocks)` tuples
+</ResponseField>
+
+Reads blocks 2-5 containing the GPT entries and extracts:
+- Partition name (UTF-16LE decoded)
+- Start LBA (block address)
+- End LBA
+
+#### Example
+
+```python
+from modules.functions import switch_user, parse_gpt
+
+switch_user(dev)
+gpt = parse_gpt(dev)
+
+# Display all partitions
+for name, (start, size) in gpt.items():
+    size_mb = (size * 512) / (1024 * 1024)
+    print(f"{name:20s}: block {start:8d}, {size_mb:8.2f} MB")
+
+# Access specific partition
+if "RECOVERY" in gpt:
+    recovery_start, recovery_size = gpt["RECOVERY"]
+    print(f"Recovery at block {recovery_start}")
+```
+
+#### Sample Output
+
+```
+proinfo             : block     6144,     3.00 MB
+nvram               : block    12288,     5.00 MB
+protect1            : block    22528,    10.00 MB
+protect2            : block    43008,    10.00 MB
+lk                  : block    63488,     1.00 MB
+lk2                 : block    65536,     1.00 MB
+boot                : block    67584,    16.00 MB
+recovery            : block   100352,    16.00 MB
+logo                : block   133120,     3.00 MB
+tee1                : block   139264,     5.00 MB
+tee2                : block   149504,     5.00 MB
+system              : block   159744,  1536.00 MB
+vendor              : block  3307520,   256.00 MB
+cache               : block  3831808,   256.00 MB
+userdata            : block  4356096, 11776.00 MB
+```
+
+## Boot Mode Functions
+
+These functions manipulate the MISC partition to control device boot behavior.
+
+### force_fastboot()
+
+Sets persistent fastboot mode flag.
+
+```python
+from modules.functions import force_fastboot
+
+force_fastboot(dev, gpt)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance
+</ParamField>
+
+<ParamField path="gpt" type="dict" required>
+  GPT dictionary from `parse_gpt()`
+</ParamField>
+
+Writes `FASTBOOT_PLEASE` to the MISC partition. Device will boot to fastboot on next reboot.
+
+### temp_fastboot()
+
+Sets temporary fastboot mode flag.
+
+```python
+from modules.functions import temp_fastboot
+
+temp_fastboot(dev, gpt)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance
+</ParamField>
+
+<ParamField path="gpt" type="dict" required>
+  GPT dictionary from `parse_gpt()`
+</ParamField>
+
+Writes `boot-amonet` to MISC partition for single-boot fastboot mode.
+
+### force_recovery()
+
+Boots into recovery mode.
+
+```python
+from modules.functions import force_recovery
+
+force_recovery(dev, gpt)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance
+</ParamField>
+
+<ParamField path="gpt" type="dict" required>
+  GPT dictionary from `parse_gpt()`
+</ParamField>
+
+Writes `boot-recovery` to MISC partition.
+
+### clear_flags()
+
+Clears all boot mode flags.
+
+```python
+from modules.functions import clear_flags
+
+clear_flags(dev, gpt)
+```
+
+<ParamField path="dev" type="Device" required>
+  Initialized `Device` instance
+</ParamField>
+
+<ParamField path="gpt" type="dict" required>
+  GPT dictionary from `parse_gpt()`
+</ParamField>
+
+Zeros out the first 32 bytes of MISC partition, allowing normal boot.
+
+#### Example
+
+```python
+from modules.functions import parse_gpt, force_fastboot, switch_user
+
+# Boot to fastboot mode
+switch_user(dev)
+gpt = parse_gpt(dev)
+force_fastboot(dev, gpt)
+dev.reboot()
+
+# Device will now boot to fastboot mode
+```
+
+## System Utilities
+
+### check_modemmanager()
+
+Checks if ModemManager is running and exits if found.
+
+```python
+from modules.functions import check_modemmanager
+
+check_modemmanager()
+```
+
+ModemManager interferes with serial communication on Linux. This function:
+- Scans running processes for `modemmanager`
+- Exits with error message if found
+- Safe to call on all platforms (only checks on Linux)
+
+#### Example
+
+```python
+#!/usr/bin/env python3
+from modules.functions import check_modemmanager
+from modules.common import Device
+
+# Always check at script start
+check_modemmanager()
+
+dev = Device()
+dev.find_device()
+# ... continue with exploit
+```
+
+### UserInputThread
+
+Thread class that prompts user for input without blocking device operations.
+
+```python
+from modules.functions import UserInputThread
+import time
+
+thread = UserInputThread(msg="Press Enter when ready...")
+thread.start()
+
+# Continue device operations
+while not thread.done:
+    dev.kick_watchdog()
+    time.sleep(1)
+
+print("User pressed Enter, continuing...")
+```
+
+<ParamField path="msg" type="str" optional>
+  Custom message to display (default: "Remove short and press Enter")
+</ParamField>
+
+<ResponseField name="done" type="bool">
+  Set to `True` when user presses Enter
+</ResponseField>
+
+This is used in the exploit to wait for hardware shorts to be removed while keeping the device alive with watchdog kicks.
+
+#### Default Message
+
+```
+* * * If you have a short attached, remove it now * * *
+* * * Press Enter to continue * * *
+```
+
+## Complete Workflow Example
+
+Here's a complete script demonstrating common operations:
+
+```python
+#!/usr/bin/env python3
+import sys
+from modules.common import Device
+from modules.load_payload import load_payload
+from modules.functions import (
+    check_modemmanager,
+    switch_user,
+    switch_boot0,
+    parse_gpt,
+    dump_binary,
+    flash_binary,
+    force_fastboot
+)
+
+# Check for ModemManager
+check_modemmanager()
+
+# Initialize and exploit
+dev = Device()
+dev.find_device()
+load_payload(dev)
+
+print("[+] Payload loaded, starting operations...")
+
+# Backup boot0
+print("[+] Backing up boot0...")
+switch_boot0(dev)
+dump_binary(dev, "boot0_backup.bin", start_block=0, max_size=4*1024*1024)
+
+# Parse GPT
+print("[+] Parsing GPT...")
+switch_user(dev)
+gpt = parse_gpt(dev)
+
+# Backup recovery partition
+if "RECOVERY" in gpt:
+    print("[+] Backing up recovery partition...")
+    rec_start, rec_size = gpt["RECOVERY"]
+    dump_binary(dev, "recovery_backup.img",
+                start_block=rec_start,
+                max_size=rec_size * 512)
+
+# Flash custom recovery (if exists)
+try:
+    print("[+] Flashing custom recovery...")
+    flash_binary(dev, "twrp.img", start_block=gpt["RECOVERY"][0])
+except FileNotFoundError:
+    print("[-] twrp.img not found, skipping")
+
+# Set fastboot mode and reboot
+print("[+] Setting fastboot mode...")
+force_fastboot(dev, gpt)
+print("[+] Rebooting to fastboot...")
+dev.reboot()
+
+print("[+] Done! Device will boot to fastboot mode.")
+```

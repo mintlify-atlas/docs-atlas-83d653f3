@@ -1,0 +1,385 @@
+---
+title: Installation
+description: Step-by-step guide to installing and building Kamakiri
+---
+
+This guide covers the complete installation process for Kamakiri, including Python dependencies and building the ARM payloads.
+
+## Overview
+
+Kamakiri consists of:
+- Python scripts for USB/serial communication and orchestration
+- C payloads that run on the device (bootrom stages, LK payload, microloader)
+- Pre-built binary images (preloader, LK, TrustZone, TWRP)
+- Shell scripts for automation
+
+<Steps>
+
+<Step title="Clone the Repository">
+
+First, clone the Kamakiri repository:
+
+```bash
+git clone https://github.com/amonet-kamakiri/kamakiri.git
+cd kamakiri
+```
+
+Verify the directory structure:
+
+```bash
+ls -la
+```
+
+You should see:
+- `brom-payload/` - Bootrom exploit payloads
+- `lk-payload/` - LK (Little Kernel) payload
+- `microloader/` - Microloader binary
+- `modules/` - Python modules
+- `requirements.txt` - Python dependencies
+- `makedist.sh` - Distribution builder script
+
+</Step>
+
+<Step title="Install Python Dependencies">
+
+Install the required Python packages using pip:
+
+```bash
+pip3 install -r requirements.txt
+```
+
+This installs:
+- `future==0.17.1`
+- `iso8601==0.1.12`
+- `pyserial==3.4`
+- `pyusb==1.0.2`
+- `PyYAML==5.1.2`
+
+Verify the installation:
+
+```bash
+python3 -c "import serial, usb.core, yaml; print('Dependencies OK')"
+```
+
+<Note>
+If you encounter permission issues with USB access, you may need to add your user to the `dialout` group:
+
+```bash
+sudo usermod -a -G dialout $USER
+```
+
+Log out and back in for the group change to take effect.
+</Note>
+
+</Step>
+
+<Step title="Build the Bootrom Payloads">
+
+The bootrom exploit uses three stages that must be compiled:
+
+Navigate to the brom-payload directory and build:
+
+```bash
+cd brom-payload
+make
+```
+
+This builds:
+- **stage1.bin** - Initial exploit stage loaded into bootrom
+- **stage2.bin** - Second stage with full hardware access
+- **pl.bin** - Preloader payload
+
+The Makefile (`brom-payload/Makefile:1-82`) configures:
+- Compiler: `arm-none-eabi-gcc`
+- Target: Cortex-A9 (`-mcpu=cortex-a9`)
+- Optimization: `-Os` (size optimization)
+- Thumb mode: `-mthumb`
+
+Verify the build output:
+
+```bash
+ls -lh stage1/stage1.bin stage2/stage2.bin pl/pl.bin
+```
+
+Return to the root directory:
+
+```bash
+cd ..
+```
+
+</Step>
+
+<Step title="Build the LK Payload">
+
+The LK payload runs in the Little Kernel bootloader stage:
+
+```bash
+cd lk-payload
+make
+```
+
+This produces `build/payload.bin`, which is padded to 512 bytes (see `lk-payload/Makefile:19-21`).
+
+Verify the build:
+
+```bash
+ls -lh build/payload.bin
+```
+
+The payload should be exactly 512 bytes:
+
+```bash
+stat -c%s build/payload.bin
+# Should output: 512
+```
+
+Return to the root directory:
+
+```bash
+cd ..
+```
+
+</Step>
+
+<Step title="Build the Microloader">
+
+The microloader is injected into the boot partition:
+
+```bash
+cd microloader
+make
+```
+
+This builds `build/payload.bin` which will be processed by `inject_microloader.py`.
+
+<Note>
+The microloader is a small ARM payload that executes early in the boot process and can be used to intercept the boot sequence.
+</Note>
+
+Return to the root directory:
+
+```bash
+cd ..
+```
+
+</Step>
+
+<Step title="Prepare Required Binary Images">
+
+Kamakiri requires several pre-built binary images in the `bin/` directory:
+
+- `preloader.img` - Modified preloader
+- `lk.bin` - Downgraded Little Kernel
+- `tz.img` - Downgraded TrustZone image
+- `twrp.img` - TWRP recovery image
+- `microloader.bin` - Compiled microloader (processed)
+- `gpt-mantis.bin` - GPT table for Mantis devices
+
+<Warning>
+**Important:** These binary images are device-specific and typically need to be obtained from device-specific sources or extracted from firmware. They are not included in the base repository.
+
+The `makedist.sh` script (see step 6) expects these files to be present in `bin/`.
+</Warning>
+
+Create the `bin` directory if it doesn't exist:
+
+```bash
+mkdir -p bin
+```
+
+Place the required binary images in this directory before proceeding.
+
+</Step>
+
+<Step title="Build Distribution (Optional)">
+
+The `makedist.sh` script creates a complete distribution package:
+
+```bash
+./makedist.sh
+```
+
+This script (`makedist.sh:1-40`) creates three distribution variants in the `dist/` directory:
+
+- **dist/unlock/** - Main exploit package
+- **dist/gptfix/** - GPT repair tools
+- **dist/full/** - Combined unlock + gptfix
+
+The distribution includes:
+- All compiled payloads
+- Python modules
+- Binary images
+- Execution scripts (`bootrom-step.sh`, `fastboot-step.sh`, etc.)
+
+<Note>
+The distribution structure is designed to be flashable as an Android update package (see `META-INF/com/google/android/` structure).
+</Note>
+
+</Step>
+
+</Steps>
+
+## Verifying the Installation
+
+After completing the build process, verify all components are present:
+
+```bash
+# Check bootrom payloads
+ls -lh brom-payload/stage1/stage1.bin \
+       brom-payload/stage2/stage2.bin \
+       brom-payload/pl/pl.bin
+
+# Check LK payload
+ls -lh lk-payload/build/payload.bin
+
+# Check microloader
+ls -lh microloader/build/payload.bin
+
+# Check Python modules
+ls -lh modules/*.py
+```
+
+Test the Python environment:
+
+```bash
+cd modules
+python3 -c "import common, logger, load_payload, functions; print('All modules OK')"
+cd ..
+```
+
+## Troubleshooting
+
+### Compilation Errors
+
+<AccordionGroup>
+  <Accordion title="arm-none-eabi-gcc: command not found">
+    Install the ARM cross-compilation toolchain:
+    
+    ```bash
+    sudo apt install gcc-arm-none-eabi binutils-arm-none-eabi
+    ```
+  </Accordion>
+
+  <Accordion title="make: command not found">
+    Install build-essential:
+    
+    ```bash
+    sudo apt install build-essential
+    ```
+  </Accordion>
+
+  <Accordion title="Permission denied when building">
+    Ensure the build scripts have execute permissions:
+    
+    ```bash
+    chmod +x makedist.sh bootrom-step.sh fastboot-step.sh
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Python Issues
+
+<AccordionGroup>
+  <Accordion title="ModuleNotFoundError: No module named 'serial'">
+    Reinstall pyserial:
+    
+    ```bash
+    pip3 install --force-reinstall pyserial==3.4
+    ```
+  </Accordion>
+
+  <Accordion title="USB permission denied">
+    Add your user to the dialout group and create a udev rule:
+    
+    ```bash
+    sudo usermod -a -G dialout $USER
+    echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", MODE="0666"' | sudo tee /etc/udev/rules.d/51-mediatek.rules
+    sudo udevadm control --reload-rules
+    ```
+    
+    Log out and back in for changes to take effect.
+  </Accordion>
+
+  <Accordion title="Python version mismatch">
+    Kamakiri requires Python 3. Verify your version:
+    
+    ```bash
+    python3 --version
+    ```
+    
+    Ensure you're using `python3` and `pip3`, not `python` and `pip`.
+  </Accordion>
+</AccordionGroup>
+
+### Build Verification Issues
+
+<AccordionGroup>
+  <Accordion title="Binary files missing after build">
+    Clean and rebuild:
+    
+    ```bash
+    cd brom-payload && make clean && make && cd ..
+    cd lk-payload && make clean && make && cd ..
+    cd microloader && make clean && make && cd ..
+    ```
+  </Accordion>
+
+  <Accordion title="makedist.sh fails">
+    Ensure all payloads are built and binary images are in `bin/`:
+    
+    ```bash
+    # Check required files
+    ls bin/preloader.img bin/lk.bin bin/tz.img bin/twrp.img bin/microloader.bin
+    ls brom-payload/stage1/stage1.bin lk-payload/build/payload.bin
+    ```
+    
+    If any files are missing, you need to obtain the device-specific binary images.
+  </Accordion>
+</AccordionGroup>
+
+## Understanding the Components
+
+### Bootrom Payloads
+
+The three-stage bootrom exploit (`brom-payload/`):
+
+1. **Stage 1** (`stage1.c`) - Minimal code injected via the bootrom vulnerability, sets up stage 2
+2. **Stage 2** (`stage2.c`) - Full payload with EMMC, crypto, and driver support
+3. **PL Payload** (`pl.c`) - Preloader-level access for advanced operations
+
+See `brom-payload/Makefile:9-15` for the source file breakdown.
+
+### Python Modules
+
+The main Python modules (`modules/`):
+
+- **main.py** - Main entry point, orchestrates the exploit (`modules/main.py:1-136`)
+- **common.py** - Device communication class (`Device`) with USB/serial protocol (`modules/common.py:66-358`)
+- **load_payload.py** - Payload loading and injection logic
+- **functions.py** - Helper functions for EMMC operations, GPT parsing, ModemManager check (`modules/functions.py:24-34`)
+- **logger.py** - Logging utilities
+
+### Execution Scripts
+
+Shell script wrappers:
+
+- **bootrom-step.sh** - Executes the bootrom exploit stage (`bootrom-step.sh:5-6`)
+- **fastboot-step.sh** - Fastboot operations
+- **boot-recovery.sh** / **boot-fastboot.sh** - Boot mode helpers
+
+## Next Steps
+
+With Kamakiri installed and built, you're ready to:
+
+1. Review the [Usage Guide](/usage/quickstart) to understand the exploit workflow
+2. Learn about [Device Communication](/architecture/device-communication) procedures
+3. Understand the [Bootrom Exploit Process](/usage/bootrom-exploit) in detail
+
+<Warning>
+Before proceeding, ensure you have:
+- ✅ All payloads built successfully
+- ✅ Required binary images in `bin/`
+- ✅ ModemManager disabled
+- ✅ USB permissions configured
+- ✅ Backup of important data from your device
+</Warning>

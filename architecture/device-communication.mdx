@@ -1,0 +1,686 @@
+---
+title: 'Device Communication'
+description: 'Serial communication protocol, USB handshake, and command structure'
+---
+
+## Communication Overview
+
+Kamakiri communicates with MediaTek devices over USB serial using a custom binary protocol. The communication has two phases:
+
+1. **BootROM phase**: Initial handshake and exploit delivery
+2. **Payload phase**: Command-based interface for device operations
+
+## USB Device Identification
+
+### Device Detection
+
+Kamakiri looks for MediaTek devices with specific USB identifiers:
+
+```python
+VID = "0E8D"  # MediaTek Vendor ID
+PID = "0003"  # BootROM mode Product ID
+BAUD = 115200  # Serial baud rate
+TIMEOUT = 5    # Command timeout (seconds)
+```
+
+### Port Detection
+
+<CodeGroup>
+```python modules/common.py
+def serial_ports():
+    """Lists available serial ports matching MediaTek VID"""
+    result = set()
+    ports = list(serial.tools.list_ports.comports())
+    
+    for port in ports:
+        portHwid = port.hwid
+        portDevice = port.device
+        
+        if VID in portHwid:
+            try:
+                s = serial.Serial(portDevice, timeout=TIMEOUT)
+                s.close()
+                result.add(port)
+            except (OSError, serial.SerialException):
+                pass
+    
+    return result
+```
+</CodeGroup>
+
+### Automatic Device Discovery
+
+```python
+class Device:
+    def find_device(self):
+        log("Waiting for device")
+        
+        old = serial_ports()
+        while True:
+            new = serial_ports()
+            
+            # Port added - device connected
+            if new > old:
+                port = (new - old).pop()
+                break
+            # Port removed - device disconnected
+            elif old > new:
+                old = new
+            
+            time.sleep(0.25)
+        
+        log("Found port = {}".format(port.device))
+        self.dev = serial.Serial(port.device, BAUD, timeout=TIMEOUT)
+```
+
+<Note>
+The script waits for a new MediaTek device to appear, making it easy to trigger by powering on or resetting the device.
+</Note>
+
+## BootROM Handshake
+
+### Phase 1: Initial Handshake
+
+The BootROM uses a 4-byte handshake sequence to establish communication:
+
+<Steps>
+  <Step title="Start Byte Search">
+    Send `0xA0` repeatedly until receiving `0x5F` response
+  </Step>
+  
+  <Step title="Complete Sequence">
+    Exchange three more byte pairs to complete handshake
+  </Step>
+  
+  <Step title="Ready State">
+    BootROM is now ready to receive commands
+  </Step>
+</Steps>
+
+<CodeGroup>
+```python modules/common.py
+def handshake(self):
+    # Look for start byte
+    while True:
+        c = self._writeb(b'\xa0')
+        if c == b'\x5f':
+            self.dev.flushInput()
+            self.dev.flushOutput()
+            break
+        self.dev.flushInput()
+        self.dev.flushOutput()
+    
+    # Complete sequence
+    self.check(self._writeb(b'\x0a'), b'\xf5')
+    self.check(self._writeb(b'\x50'), b'\xaf')
+    self.check(self._writeb(b'\x05'), b'\xfa')
+```
+</CodeGroup>
+
+### Handshake Sequence
+
+| Step | Host Sends | Device Responds | Status |
+|------|-----------|-----------------|--------|
+| 1 | `0xA0` | `0x5F` | Start byte found |
+| 2 | `0x0A` | `0xF5` | Sequence 1 |
+| 3 | `0x50` | `0xAF` | Sequence 2 |
+| 4 | `0x05` | `0xFA` | Ready |
+
+<Warning>
+If the sequence fails, the device must be power cycled to retry.
+</Warning>
+
+## BootROM Commands
+
+After the handshake, the BootROM accepts standard MediaTek download agent commands:
+
+### Read Memory (0xD1)
+
+<CodeGroup>
+```python Read 32-bit Words
+def read32(self, addr, size=1):
+    result = []
+    
+    self.dev.write(b'\xd1')
+    self.check(self.dev.read(1), b'\xd1')  # Echo cmd
+    
+    self.dev.write(struct.pack('>I', addr))
+    self.check_int(self.dev.read(4), addr)  # Echo addr
+    
+    self.dev.write(struct.pack('>I', size))
+    self.check_int(self.dev.read(4), size)  # Echo size
+    
+    self.check(self.dev.read(2), b'\x00\x00')  # Arg check
+    
+    for _ in range(size):
+        data = struct.unpack('>I', self.dev.read(4))[0]
+        result.append(data)
+    
+    self.check(self.dev.read(2), b'\x00\x00')  # Status
+    
+    return result[0] if len(result) == 1 else result
+```
+</CodeGroup>
+
+### Write Memory (0xD4)
+
+<CodeGroup>
+```python Write 32-bit Words
+def write32(self, addr, words, status_check=True):
+    if not isinstance(words, list):
+        words = [words]
+    
+    self.dev.write(b'\xd4')
+    self.check(self.dev.read(1), b'\xd4')  # Echo cmd
+    
+    self.dev.write(struct.pack('>I', addr))
+    self.check_int(self.dev.read(4), addr)  # Echo addr
+    
+    self.dev.write(struct.pack('>I', len(words)))
+    self.check_int(self.dev.read(4), len(words))  # Echo size
+    
+    self.check(self.dev.read(2), b'\x00\x01')  # Arg check
+    
+    for word in words:
+        self.dev.write(struct.pack('>I', word))
+        self.check_int(self.dev.read(4), word)  # Echo word
+    
+    if status_check:
+        self.check(self.dev.read(2), b'\x00\x01')  # Status
+```
+</CodeGroup>
+
+### Send Download Agent (0xD7)
+
+Used to load the initial stage 1 payload:
+
+<CodeGroup>
+```python Load Payload
+def send_da(self, da_address, da_len, sig_len, da):
+    self.echo(0xD7)
+    
+    self.echo(da_address, 4)
+    self.echo(da_len, 4)
+    self.echo(sig_len, 4)
+    
+    self.check(self.read(2), to_bytes(0, 2))
+    
+    self.dev.write(da)  # Send payload
+    
+    checksum = self.dev.read(2)
+    self.check(self.read(2), to_bytes(0, 2))
+```
+</CodeGroup>
+
+### Jump to Address (0xD5)
+
+Execute loaded code:
+
+<CodeGroup>
+```python Execute Payload
+def jump_da(self, da_address):
+    self.echo(0xD5)
+    self.echo(da_address, 4)
+    self.check(self.read(2), to_bytes(0, 2))
+```
+</CodeGroup>
+
+## Payload Command Protocol
+
+Once stage 1 or stage 2 payloads are running, they implement a custom command protocol:
+
+### Protocol Structure
+
+Every command follows this format:
+
+```
+┌─────────────┬─────────────┬─────────────┬─────────────┐
+│   Magic     │   Command   │    Args     │    Data     │
+│ (4 bytes)   │  (4 bytes)  │  (varies)   │  (varies)   │
+│ 0xf00dd00d  │   0x____    │   ......    │   ......    │
+└─────────────┴─────────────┴─────────────┴─────────────┘
+```
+
+### Magic Number
+
+All commands must start with the magic value to prevent desynchronization:
+
+```python
+MAGIC = 0xf00dd00d
+```
+
+<Warning>
+If an incorrect magic value is received, the payload exits the command loop and the device must be reset.
+</Warning>
+
+### Response Patterns
+
+| Response | Meaning |
+|----------|----------|
+| `0xA1A2A3A4` | Stage 1 ready |
+| `0xB1B2B3B4` | Stage 2 ready |
+| `0xD0D0D0D0` | Success |
+| `0xF0F0F0F0` | Failure |
+
+## Stage 1 Commands
+
+### Write Memory (0x4000)
+
+Write arbitrary data to device memory:
+
+```python
+# Send command
+self.dev.write(p32_be(0xf00dd00d))  # Magic
+self.dev.write(p32_be(0x4000))       # Write command
+self.dev.write(p32_be(address))      # Target address
+self.dev.write(p32_be(size))         # Data size
+self.dev.write(data)                 # Data payload
+
+# Read response
+code = self.dev.read(4)
+if code != b"\xd0\xd0\xd0\xd0":
+    raise RuntimeError("Write failed")
+```
+
+### Jump to Address (0x4001)
+
+Transfer execution to loaded code:
+
+```python
+self.dev.write(p32_be(0xf00dd00d))  # Magic
+self.dev.write(p32_be(0x4001))       # Jump command
+self.dev.write(p32_be(address))      # Target address
+# No response - execution continues at new address
+```
+
+### Reboot Device (0x3000)
+
+Reset the device:
+
+```python
+self.dev.write(p32_be(0xf00dd00d))  # Magic
+self.dev.write(p32_be(0x3000))       # Reboot command
+# Device resets immediately
+```
+
+### Kick Watchdog (0x3001)
+
+Prevent watchdog timeout:
+
+```python
+self.dev.write(p32_be(0xf00dd00d))  # Magic
+self.dev.write(p32_be(0x3001))       # Watchdog kick
+```
+
+<Note>
+The watchdog must be kicked regularly (every few seconds) to prevent automatic device reset.
+</Note>
+
+## Stage 2 Commands
+
+Stage 2 extends the command set with eMMC and memory operations.
+
+### Read eMMC Block (0x1000)
+
+Read a 512-byte block from eMMC:
+
+<CodeGroup>
+```python modules/common.py
+def emmc_read(self, idx):
+    # Send command
+    self.dev.write(p32_be(0xf00dd00d))  # Magic
+    self.dev.write(p32_be(0x1000))       # Read command
+    self.dev.write(p32_be(idx))          # Block index
+    
+    # Read data
+    data = self.dev.read(0x200)  # 512 bytes
+    if len(data) != 0x200:
+        raise RuntimeError("read fail")
+    
+    return data
+```
+</CodeGroup>
+
+### Write eMMC Block (0x1001)
+
+Write a 512-byte block to eMMC:
+
+<CodeGroup>
+```python modules/common.py
+def emmc_write(self, idx, data):
+    if len(data) != 0x200:
+        raise RuntimeError("data must be 0x200 bytes")
+    
+    # Send command
+    self.dev.write(p32_be(0xf00dd00d))  # Magic
+    self.dev.write(p32_be(0x1001))       # Write command
+    self.dev.write(p32_be(idx))          # Block index
+    self.dev.write(data)                 # Data (512 bytes)
+    
+    # Check response
+    code = self.dev.read(4)
+    if code != b"\xd0\xd0\xd0\xd0":
+        raise RuntimeError("device failure")
+```
+</CodeGroup>
+
+### Switch Partition (0x1002)
+
+Change the active eMMC partition:
+
+```python
+def emmc_switch(self, part):
+    self.dev.write(p32_be(0xf00dd00d))  # Magic
+    self.dev.write(p32_be(0x1002))       # Switch command
+    self.dev.write(p32_be(part))         # Partition ID
+```
+
+**Partition IDs:**
+- `0`: USER (main storage)
+- `1`: BOOT0 (boot partition 0)
+- `2`: BOOT1 (boot partition 1)
+- `3`: RPMB (secure storage)
+
+### Read RPMB (0x2000)
+
+Read from Replay Protected Memory Block:
+
+```python
+def rpmb_read(self):
+    self.dev.write(p32_be(0xf00dd00d))  # Magic
+    self.dev.write(p32_be(0x2000))       # RPMB read
+    
+    data = self.dev.read(0x100)  # 256 bytes
+    if len(data) != 0x100:
+        raise RuntimeError("read fail")
+    
+    return data
+```
+
+### Write RPMB (0x2001)
+
+Write to Replay Protected Memory Block:
+
+```python
+def rpmb_write(self, data):
+    if len(data) != 0x100:
+        raise RuntimeError("data must be 0x100 bytes")
+    
+    self.dev.write(p32_be(0xf00dd00d))  # Magic
+    self.dev.write(p32_be(0x2001))       # RPMB write
+    self.dev.write(data)                 # Data (256 bytes)
+```
+
+### Memory Read (0x5000)
+
+Read arbitrary memory region:
+
+```python
+def mem_read(self, address, size):
+    self.dev.write(p32_be(0xf00dd00d))  # Magic
+    self.dev.write(p32_be(0x5000))       # Memory read
+    self.dev.write(p32_be(address))      # Address
+    self.dev.write(p32_be(size))         # Size
+    
+    data = self.dev.read(size)
+    if len(data) != size:
+        raise RuntimeError("read fail")
+    
+    return data
+```
+
+### IDME Read (0x7000)
+
+Read Amazon IDME (ID Manage Entity) fields:
+
+```python
+def idme_read(self, field_name):
+    self.dev.write(p32_be(0xf00dd00d))  # Magic
+    self.dev.write(p32_be(0x7000))       # IDME read
+    
+    # Pad field name to 16 bytes
+    if len(field_name) < 16:
+        field_name += b"\x00" * (16 - len(field_name))
+    self.dev.write(field_name)
+    
+    # Read size and data
+    size = int.from_bytes(self.dev.read(4), byteorder="big")
+    data = self.dev.read(size)
+    
+    # Check for errors
+    if data == to_bytes(0xffffffff, 4):
+        raise RuntimeError("read fail")
+    elif data == to_bytes(0xbeefdeed, 4):
+        raise RuntimeError("IDME invalid")
+    elif data == to_bytes(0xdeadbeef, 4):
+        return None  # Field not found
+    
+    return data
+```
+
+## Command Reference Table
+
+### Stage 1 Commands
+
+| Command | Value | Args | Response |
+|---------|-------|------|----------|
+| Write Memory | `0x4000` | addr (4), size (4), data | `0xD0D0D0D0` |
+| Jump | `0x4001` | addr (4) | None |
+| Reboot | `0x3000` | None | None |
+| Kick Watchdog | `0x3001` | None | None |
+
+### Stage 2 Commands
+
+| Command | Value | Args | Response |
+|---------|-------|------|----------|
+| Read Block | `0x1000` | block (4) | data (512) |
+| Write Block | `0x1001` | block (4), data (512) | `0xD0D0D0D0` |
+| Switch Partition | `0x1002` | part (4) | None |
+| Read RPMB | `0x2000` | None | data (256) |
+| Write RPMB | `0x2001` | data (256) | None |
+| Memory Read | `0x5000` | addr (4), size (4) | data |
+| IDME Read | `0x7000` | field (16) | size (4), data |
+| Reboot | `0x3000` | None | None |
+| Kick Watchdog | `0x3001` | None | None |
+
+## Error Handling
+
+### Protocol Errors
+
+The payload validates every command with the magic number:
+
+```c
+uint32_t magic = recv_dword();
+if (magic != 0xf00dd00d) {
+    printf("Protocol error\n");
+    break;  // Exit command loop
+}
+```
+
+<Warning>
+A protocol error causes the payload to exit. The device must be reset to continue.
+</Warning>
+
+### Response Validation
+
+The Python code validates all responses:
+
+```python
+def check(self, test, gold):
+    if test != gold:
+        raise RuntimeError(
+            "Serial protocol mismatch, expected {} got {}".format(
+                gold.hex(), test.hex()
+            )
+        )
+```
+
+### Timeout Handling
+
+All serial operations have a 5-second timeout:
+
+```python
+TIMEOUT = 5  # seconds
+self.dev = serial.Serial(port.device, BAUD, timeout=TIMEOUT)
+```
+
+If a timeout occurs, a `serial.SerialTimeoutException` is raised.
+
+## Watchdog Management
+
+### Why Watchdog Matters
+
+MediaTek devices have a hardware watchdog timer that resets the device if not periodically kicked. During exploit delivery and payload operations, the watchdog must be managed.
+
+### Initial Disable
+
+The exploit disables the watchdog before loading stage 1:
+
+```python
+log("Disable watchdog")
+dev.write32(0x10007000, 0x22000000)
+```
+
+### Periodic Kicking
+
+During long operations, kick the watchdog regularly:
+
+```python
+while not thread.done:
+    dev.write32(0x10007008, 0x1971)  # Low-level watchdog kick
+    time.sleep(1)
+```
+
+### Command-Based Kicking
+
+Once payloads are loaded, use the kick command:
+
+```python
+def kick_watchdog(self):
+    self.dev.write(p32_be(0xf00dd00d))  # Magic
+    self.dev.write(p32_be(0x3001))       # Kick command
+```
+
+<Note>
+Most Kamakiri scripts automatically handle watchdog management, but custom scripts must implement it.
+</Note>
+
+## Example: Complete Operation Sequence
+
+Here's a complete sequence showing device communication from start to finish:
+
+<CodeGroup>
+```python Full Operation
+# 1. Find and connect to device
+dev = Device()
+dev.find_device()
+
+# 2. Perform handshake
+dev.handshake()
+
+# 3. Disable watchdog
+dev.write32(0x10007000, 0x22000000)
+
+# 4. Load stage 1 payload
+payload = load_payload_file("stage1.bin")
+dev.send_da(0x100A00, len(payload), 0, payload)
+dev.jump_da(0x100A00)
+
+# 5. Wait for stage 1 ready signal
+data = dev.dev.read(4)
+assert data == b"\xA1\xA2\xA3\xA4"
+
+# 6. Kick watchdog
+dev.kick_watchdog()
+
+# 7. Load stage 2 payload
+stage2 = load_payload_file("stage2.bin")
+dev.dev.write(p32(0xf00dd00d))  # Magic
+dev.dev.write(p32(0x4000))       # Write command
+dev.dev.write(p32(0x201000))     # Address
+dev.dev.write(p32(len(stage2)))  # Size
+dev.dev.write(stage2)            # Data
+
+# 8. Check write success
+code = dev.dev.read(4)
+assert code == b"\xd0\xd0\xd0\xd0"
+
+# 9. Jump to stage 2
+dev.dev.write(p32(0xf00dd00d))  # Magic
+dev.dev.write(p32(0x4001))       # Jump command
+dev.dev.write(p32(0x201000))     # Address
+
+# 10. Wait for stage 2 ready signal
+data = dev.dev.read(4)
+assert data == b"\xB1\xB2\xB3\xB4"
+
+# 11. Now we have full eMMC access
+block_data = dev.emmc_read(0)  # Read first block
+print("First block:", block_data.hex())
+```
+</CodeGroup>
+
+## Debugging
+
+### UART Output
+
+All payloads send debug output to UART1:
+
+```c
+void low_uart_put(int ch) {
+    volatile uint32_t *uart_reg0 = (volatile uint32_t*)0x11003014;
+    volatile uint32_t *uart_reg1 = (volatile uint32_t*)0x11003000;
+    
+    while (!((*uart_reg0) & 0x20)) {}
+    *uart_reg1 = ch;
+}
+```
+
+**UART Settings:**
+- Baud rate: 115200
+- Data bits: 8
+- Parity: None
+- Stop bits: 1
+
+### Common Issues
+
+<AccordionGroup>
+  <Accordion title="Handshake Fails" icon="plug">
+    - Device not in BootROM mode
+    - Wrong USB cable (must support data)
+    - ModemManager interfering (Linux)
+    - Incorrect baud rate
+  </Accordion>
+  
+  <Accordion title="Protocol Mismatch" icon="triangle-exclamation">
+    - Commands sent out of order
+    - Incorrect endianness (use big-endian)
+    - Missing magic value
+    - Buffer flush needed
+  </Accordion>
+  
+  <Accordion title="Device Resets" icon="power-off">
+    - Watchdog not being kicked
+    - Invalid memory write
+    - USB power interruption
+  </Accordion>
+  
+  <Accordion title="Timeout Errors" icon="clock">
+    - Device not responding
+    - Payload crashed
+    - USB communication error
+    - Need to power cycle device
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture Overview" icon="sitemap" href="./overview">
+    Review the complete system architecture
+  </Card>
+  
+  <Card title="Payload System" icon="layer-group" href="./payload-system">
+    Learn about payload implementation details
+  </Card>
+</CardGroup>

@@ -1,0 +1,548 @@
+---
+title: Safety Warnings
+description: Critical warnings about risks and device damage
+icon: triangle-exclamation
+---
+
+<Warning>
+**READ THIS ENTIRE PAGE BEFORE PROCEEDING**
+
+The Kamakiri exploit performs low-level operations on your device that can result in **permanent damage** if not properly understood. These warnings are not exaggerations.
+</Warning>
+
+## Critical Risks
+
+### RPMB Downgrade - Irreversible
+
+<Warning>
+**This operation CANNOT be undone**
+
+The exploit zeroes out the RPMB (Replay Protected Memory Block) region to enable bootloader downgrade:
+
+```python
+# From modules/main.py:68-75
+log("Downgrade rpmb")
+dev.rpmb_write(b"\x00" * 0x100)
+log("Recheck rpmb")
+rpmb = dev.rpmb_read()
+if rpmb != b"\x00" * 0x100:
+    dev.reboot()
+    raise RuntimeError("downgrade failure, giving up")
+log("rpmb downgrade ok")
+```
+
+**What this means:**
+- RPMB stores anti-rollback counters for secure boot
+- Once zeroed, you **cannot restore** the original values
+- Original RPMB data is **lost forever** if not backed up
+- Device will accept older firmware versions (security risk)
+- Future official updates may fail integrity checks
+</Warning>
+
+**Before proceeding, you MUST understand:**
+
+<AccordionGroup>
+  <Accordion title="What is RPMB?">
+    The Replay Protected Memory Block is a secure eMMC partition that stores:
+    - Anti-rollback counters
+    - Trusted boot version information  
+    - Secure storage keys
+    - Device provisioning data
+
+    It's protected by HMAC authentication and cannot normally be modified.
+  </Accordion>
+
+  <Accordion title="Why does Kamakiri zero RPMB?">
+    To downgrade the bootloader and TrustZone to vulnerable versions:
+    
+    ```python
+    # From modules/main.py:78-86
+    log("Flash tz")
+    flash_binary(dev, "../bin/tz.img", gpt["tee1"][0], gpt["tee1"][1] * 0x200)
+    
+    log("Flash lk")
+    flash_binary(dev, "../bin/lk.bin", gpt["lk"][0], gpt["lk"][1] * 0x200)
+    ```
+    
+    Without zeroing RPMB, these older versions would be rejected by secure boot.
+  </Accordion>
+
+  <Accordion title="Can I backup and restore RPMB?">
+    **No.** RPMB uses HMAC authentication with a device-unique key stored in hardware. 
+    
+    You can read RPMB before the exploit:
+    ```python
+    rpmb = dev.rpmb_read()  # 256 bytes
+    ```
+    
+    But you **cannot write it back** without the authentication key (which you don't have).
+  </Accordion>
+
+  <Accordion title="What happens if I abort during RPMB write?">
+    If you abort the exploit after RPMB is zeroed but before the bootloader is flashed:
+    - Device may not boot (anti-rollback counter mismatch)
+    - You'll need to re-run the exploit to complete the process
+    - Device is in an inconsistent state
+    
+    The exploit includes a confirmation prompt:
+    ```python
+    if rpmb[0:4] != b"AMZN":
+        thread = UserInputThread(
+            msg="rpmb looks broken; if this is expected (i.e. you're retrying the exploit) "
+                "press enter, otherwise terminate with Ctrl+C"
+        )
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Partition Corruption Risks
+
+<Warning>
+**Direct eMMC writes bypass all safety checks**
+
+Kamakiri writes directly to raw eMMC sectors, including critical system partitions:
+
+- **GPT (GUID Partition Table)**: Defines all partition layout
+- **boot0**: Contains preloader and bootloader
+- **tee1**: TrustZone trusted execution environment  
+- **lk**: LittleKernel bootloader
+- **boot**: Android boot image
+
+Corrupting any of these can **brick your device**.
+</Warning>
+
+#### Partitions Modified by Kamakiri
+
+From `modules/main.py`, the exploit writes to:
+
+<Tabs>
+  <Tab title="GPT (fixgpt mode)">
+    ```python
+    # Sectors 0-33 (17KB)
+    dev.emmc_switch(0)
+    flash_binary(dev, "../bin/gpt-mantis.bin", 0, 34 * 0x200)
+    ```
+    
+    **Risk**: Wrong GPT = device won't boot
+    
+    **When used**: Only if you run `python3 modules/main.py fixgpt`
+  </Tab>
+
+  <Tab title="BOOT0 Partition">
+    ```python
+    # LK payload at offset 1024
+    switch_boot0(dev)
+    flash_binary(dev, "../lk-payload/build/payload.bin", 1024)
+    
+    # Preloader at offset 0 (optional)
+    flash_binary(dev, "../bin/preloader.img", 0)
+    ```
+    
+    **Risk**: Corrupted BOOT0 = no boot at all (hard brick)
+    
+    **Mitigation**: Script verifies BOOT0 magic before writing
+  </Tab>
+
+  <Tab title="TrustZone (tee1)">
+    ```python
+    flash_binary(dev, "../bin/tz.img", 
+                 gpt["tee1"][0], 
+                 gpt["tee1"][1] * 0x200)
+    ```
+    
+    **Risk**: Wrong TZ = secure boot failure, possible brick
+    
+    **Note**: Downgraded version must match device
+  </Tab>
+
+  <Tab title="Bootloader (lk)">
+    ```python
+    flash_binary(dev, "../bin/lk.bin", 
+                 gpt["lk"][0], 
+                 gpt["lk"][1] * 0x200)
+    ```
+    
+    **Risk**: Wrong bootloader = boot loop or brick
+    
+    **Note**: Must be vulnerable version for exploit chain
+  </Tab>
+
+  <Tab title="Boot Partition">
+    ```python
+    # Inject microloader into boot header
+    boot_hdr1 = dev.emmc_read(gpt["boot"][0]) + dev.emmc_read(gpt["boot"][0] + 1)
+    flash_binary(dev, "../bin/microloader.bin", gpt["boot"][0], 2 * 0x200)
+    ```
+    
+    **Risk**: Corrupted boot image = can't start Android
+    
+    **Recovery**: Can be restored via fastboot if accessible
+  </Tab>
+
+  <Tab title="MISC Partition">
+    ```python
+    # Force fastboot mode
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:16] = "FASTBOOT_PLEASE\x00".encode("utf-8")
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+    ```
+    
+    **Risk**: Low - only affects boot mode flags
+    
+    **Recovery**: Can be cleared manually
+  </Tab>
+</Tabs>
+
+### Device Compatibility
+
+<Warning>
+**This exploit is ONLY for Amazon Fire HD 8 (2017) - "mantis"**
+
+Device type ID must be: `AKPGW064GI9HE`
+
+The exploit explicitly checks device identity:
+
+```python
+# From modules/main.py:29-36
+device_type_id = dev.idme_read(b"device_type_id").rstrip(b"\x00").decode("utf-8")
+
+log("Check device_type_id")
+if device_type_id == "AKPGW064GI9HE":
+    log("Detected mantis (" + device_type_id + ")")
+else:
+    log("Wrong device detected: " + device_type_id)
+    exit(1)
+```
+
+**What happens if you use the wrong device:**
+- Partition layout will be wrong
+- Bootloader images won't match
+- Memory addresses may differ
+- **High risk of hard brick**
+</Warning>
+
+**Compatible device specifications:**
+- Model: Fire HD 8 (7th Generation, 2017)
+- Codename: mantis  
+- SoC: MediaTek MT8163 (Cortex-A53)
+- Device ID: AKPGW064GI9HE
+
+**NOT compatible with:**
+- Fire HD 8 (2016, 2018, 2020, or later models)
+- Fire HD 10 (any generation)
+- Fire 7 (any generation)  
+- Other Amazon Fire tablets
+- Non-Amazon MediaTek devices
+
+## When NOT to Proceed
+
+<Warning>
+**STOP if any of these apply:**
+</Warning>
+
+<Steps>
+  <Step title="You don't have the exact device">
+    ❌ Your device is not Fire HD 8 (2017) "mantis"
+    
+    ❌ Device type ID doesn't match `AKPGW064GI9HE`
+    
+    ❌ You're not 100% certain of the model year
+  </Step>
+
+  <Step title="You don't understand the risks">
+    ❌ You don't know what RPMB is
+    
+    ❌ You don't understand "hard brick" vs "soft brick"
+    
+    ❌ You're not comfortable with command-line tools
+    
+    ❌ You haven't read the source code
+  </Step>
+
+  <Step title="You don't have recovery options">
+    ❌ No backup device available
+    
+    ❌ Can't afford to lose this device
+    
+    ❌ No experience with eMMC repair/JTAG
+    
+    ❌ Device is still under warranty you care about
+  </Step>
+
+  <Step title="Your environment isn't ready">
+    ❌ Running in a VM without proper USB passthrough
+    
+    ❌ ModemManager is running
+    
+    ❌ USB cable is unreliable or charge-only
+    
+    ❌ Computer might lose power during operation
+  </Step>
+</Steps>
+
+## Brick Recovery
+
+### Soft Brick (Device still responds via USB)
+
+**Symptoms:**
+- Device stuck at boot logo
+- Bootloop
+- Can enter fastboot/recovery mode
+- USB device detected by computer
+
+**Recovery options:**
+
+<Tabs>
+  <Tab title="Fastboot Recovery">
+    If fastboot is accessible:
+    
+    ```bash
+    # Check device
+    fastboot devices
+    
+    # Flash stock boot image
+    fastboot flash boot stock_boot.img
+    
+    # Flash stock recovery
+    fastboot flash recovery stock_recovery.img
+    
+    # Reboot
+    fastboot reboot
+    ```
+  </Tab>
+
+  <Tab title="Re-run Exploit">
+    If device is in bootrom mode:
+    
+    ```bash
+    # Try crash mode to return to bootrom
+    python3 modules/main.py crash
+    
+    # Re-run full exploit
+    python3 modules/main.py
+    ```
+  </Tab>
+
+  <Tab title="GPT Repair">
+    If GPT is corrupted:
+    
+    ```bash
+    python3 modules/main.py fixgpt
+    ```
+    
+    This restores partition table from `bin/gpt-mantis.bin`.
+  </Tab>
+</Tabs>
+
+### Hard Brick (Device completely unresponsive)
+
+**Symptoms:**
+- No screen output at all
+- Not detected via USB
+- No response to button combinations
+- No bootrom mode accessible
+
+**Recovery requires hardware access:**
+
+<Warning>
+**Hard brick recovery is DIFFICULT and may be impossible**
+
+These methods require advanced skills and specialized equipment:
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="eMMC Direct Programming">
+    **Requirements:**
+    - Device disassembly
+    - eMMC chip identification
+    - UFI Box, Easy-JTAG, or similar programmer
+    - Stock firmware dump
+    - BGA rework skills (if chip removal needed)
+
+    **Process:**
+    1. Disassemble device to access mainboard
+    2. Locate eMMC chip (usually labeled)
+    3. Connect programmer to eMMC pins (in-circuit or removed)
+    4. Write stock firmware image to eMMC
+    5. Reassemble device
+
+    **Cost:** $100-500 for tools, or $50-150 for professional service
+  </Accordion>
+
+  <Accordion title="JTAG Recovery">
+    **Requirements:**
+    - JTAG pins identified on mainboard
+    - OpenOCD or proprietary JTAG interface
+    - SoC-specific debug access
+    - Stock bootloader binaries
+
+    **Difficulty:** Very high - MediaTek JTAG often disabled in production
+
+    **Process:**
+    1. Locate JTAG test points
+    2. Connect JTAG adapter
+    3. Halt CPU and program bootloader to eMMC
+    4. Reset device
+
+    **Success rate:** Low - often locked by manufacturer
+  </Accordion>
+
+  <Accordion title="Professional Repair">
+    **When to consider:**
+    - No hardware experience
+    - Don't have specialized tools
+    - Device has sentimental value
+
+    **Where to find:**
+    - Local phone repair shops (hit or miss)
+    - Online services specializing in tablet recovery
+    - Electronics repair forums (offers from experienced users)
+
+    **Cost:** $50-200 depending on damage
+
+    **Success rate:** Varies widely
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+**Reality check**: Hard bricked tablets often aren't economically repairable. Fire HD 8 replacement cost is typically lower than professional recovery fees.
+</Note>
+
+## Legal and Warranty Implications
+
+### Warranty
+
+<Warning>
+**This exploit VOIDS your warranty**
+
+Running Kamakiri involves:
+- Modifying system partitions
+- Downgrading security components
+- Altering secure boot configuration
+
+All of these violate manufacturer terms of service.
+</Warning>
+
+**Warranty status after exploit:**
+- Amazon warranty: **VOID**
+- Retailer return policy: **VOID** (if opened/modified)
+- Accidental damage protection: Likely **VOID**
+
+**Evidence of modification:**
+- RPMB zeroed (detectable if device boots)
+- Bootloader version downgraded
+- Custom boot payloads in BOOT0
+- Partition timestamps changed
+
+### Legal Considerations
+
+<Note>
+**Disclaimer: This is not legal advice. Consult a lawyer for your jurisdiction.**
+</Note>
+
+**In the United States:**
+- Jailbreaking tablets is generally legal under DMCA exemptions
+- You own the hardware and can modify it
+- Distributing copyrighted Amazon firmware may be illegal
+- Using exploits for commercial purposes may have restrictions
+
+**In other jurisdictions:**
+- Laws vary significantly by country
+- Some countries prohibit circumventing security measures
+- Import/export restrictions may apply to exploit tools
+
+**Best practices:**
+- Only use on devices you own
+- Don't distribute Amazon's proprietary binaries
+- Don't use for warranty fraud
+- Respect copyright and licensing terms
+
+## Pre-Exploit Checklist
+
+Before running Kamakiri, verify ALL of these:
+
+<Steps>
+  <Step title="Device Verification">
+    - [ ] Device is Fire HD 8 (2017) - codename "mantis"
+    - [ ] Device type ID is `AKPGW064GI9HE` (verified)
+    - [ ] Device is fully charged (> 50%)
+    - [ ] You have a backup device or can afford to lose this one
+  </Step>
+
+  <Step title="Risk Understanding">
+    - [ ] I understand RPMB will be permanently zeroed
+    - [ ] I understand the device may brick
+    - [ ] I understand warranty will be void
+    - [ ] I have read the entire source code
+    - [ ] I accept full responsibility for consequences
+  </Step>
+
+  <Step title="Technical Readiness">
+    - [ ] Linux environment ready (not Windows/macOS)
+    - [ ] ARM toolchain installed (if building from source)
+    - [ ] Python dependencies installed
+    - [ ] ModemManager disabled/removed
+    - [ ] USB connection verified as stable
+    - [ ] Reliable power supply (no battery/brownout risk)
+  </Step>
+
+  <Step title="Backup Preparation">
+    - [ ] Important data backed up from device
+    - [ ] Stock firmware downloaded (if available)
+    - [ ] Recovery tools prepared (fastboot, etc.)
+    - [ ] Alternative device available if needed
+  </Step>
+
+  <Step title="Final Confirmation">
+    **Type this phrase if you're ready to proceed:**
+    
+    > "I understand the risks and accept full responsibility for any damage to my device, including permanent bricking, data loss, and voided warranty."
+    
+    If you can't type that without hesitation, **don't proceed**.
+  </Step>
+</Steps>
+
+## Emergency Contacts
+
+If something goes wrong:
+
+1. **Don't panic** - Many issues are recoverable
+2. **Document the error** - Save all output and error messages
+3. **Power cycle safely** - Hold power for 40 seconds to force shutdown
+4. **Seek help:**
+   - Check project issues on GitHub
+   - Search XDA-Developers forums
+   - Join relevant Discord/Telegram groups (if available)
+   - Consult with experienced developers
+
+<Warning>
+**Do NOT:**
+- Lie about what happened to get warranty service
+- Attempt eMMC programming without experience
+- Use exploit tools you don't understand
+- Keep trying the same failing operation (may make it worse)
+</Warning>
+
+## Final Words
+
+<Note>
+**Why these warnings exist:**
+
+Kamakiri is a powerful low-level exploit that provides full control over device hardware. This power comes with significant risk. These warnings are based on real incidents of bricked devices and irreversible damage.
+
+If you've read this far and still have doubts, **that's a good sign**. Healthy caution prevents expensive mistakes.
+
+Only proceed if you:
+1. Fully understand the technical details
+2. Accept the possibility of device loss
+3. Have the skills to recover from failures
+4. Are comfortable with irreversible changes
+
+When in doubt, don't do it.
+</Note>
+
+---
+
+<Tip>
+Still have questions? Review the [Troubleshooting](/advanced/troubleshooting) guide and [Building Payloads](/advanced/building-payloads) documentation before proceeding.
+</Tip>

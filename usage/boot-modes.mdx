@@ -1,0 +1,417 @@
+---
+title: 'Boot Modes'
+description: 'Control device boot behavior with fastboot and recovery mode scripts'
+icon: 'power-off'
+---
+
+Kamakiri provides scripts to boot MediaTek devices into specific modes by writing magic values to the MISC partition.
+
+## Overview
+
+After exploiting the bootrom and gaining eMMC access, you can control which mode the device boots into:
+
+- **Fastboot Mode**: For flashing images and unlocking bootloader
+- **Recovery Mode**: For factory reset, sideloading, and system recovery
+
+Both scripts use the `handshake2.py` module to communicate with the device's preloader.
+
+## Boot to Fastboot
+
+### Usage
+
+```bash
+./boot-fastboot.sh
+```
+
+This script boots the device into fastboot mode.
+
+### Script Contents
+
+```bash boot-fastboot.sh
+#!/bin/bash
+
+set -e
+
+cd modules
+python3 handshake2.py FACTFACT
+cd ..
+```
+
+### How It Works
+
+The script sends the `FACTFACT` command to the device's preloader:
+
+1. **Preloader Detection**: Waits for preloader to send `Y` byte
+2. **Command Send**: Transmits `FACTFACT` ASCII string
+3. **Mode Switch**: Preloader writes boot flag to MISC partition
+4. **Reboot**: Device reboots into fastboot mode
+
+### When to Use
+
+- Flashing system images with fastboot
+- Unlocking bootloader
+- Booting custom kernels
+- Accessing fastboot commands
+- Testing boot configurations
+
+### Expected Output
+
+```
+[2024-03-13 10:20:15] Waiting for device
+[2024-03-13 10:20:18] Found port = /dev/ttyUSB0
+[2024-03-13 10:20:18] Handshake
+[2024-03-13 10:20:18] Preloader ready, sending FACTFACT
+```
+
+Device will reboot and display fastboot screen.
+
+## Boot to Recovery
+
+### Usage
+
+```bash
+./boot-recovery.sh
+```
+
+This script boots the device into recovery mode.
+
+### Script Contents
+
+```bash boot-recovery.sh
+#!/bin/bash
+
+set -e
+
+cd modules
+python3 handshake2.py FACTORYM
+cd ..
+```
+
+### How It Works
+
+The script sends the `FACTORYM` command to the device's preloader:
+
+1. **Preloader Detection**: Waits for preloader to send `Y` byte
+2. **Command Send**: Transmits `FACTORYM` ASCII string
+3. **Mode Switch**: Preloader writes recovery flag to MISC partition
+4. **Reboot**: Device reboots into recovery mode
+
+### When to Use
+
+- Factory reset device
+- Sideload OTA updates
+- Wipe cache/data partitions
+- Restore from backup
+- Access recovery menu
+
+### Expected Output
+
+```
+[2024-03-13 10:25:30] Waiting for device
+[2024-03-13 10:25:33] Found port = /dev/ttyUSB0
+[2024-03-13 10:25:33] Handshake
+[2024-03-13 10:25:33] Preloader ready, sending FACTORYM
+```
+
+Device will reboot and display recovery menu.
+
+## Handshake2 Protocol
+
+### Implementation
+
+The `handshake2()` function is defined in modules/handshake2.py:
+
+```python modules/handshake2.py
+def handshake2(dev, cmd='FACTFACT'):
+    log("Handshake")
+    dev.handshake2(cmd)
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2:
+        dev = Device(sys.argv[2])
+    else:
+        dev = Device()
+        dev.find_device()
+    
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+    else:
+        cmd = 'FACTFACT'
+    handshake2(dev, cmd)
+```
+
+### Device-Side Protocol
+
+The actual handshake is implemented in modules/common.py:129-137:
+
+```python
+def handshake2(self, cmd='FACTFACT'):
+    # look for start byte
+    c = 0
+    while c != b'Y':
+        c = self.dev.read()
+    log("Preloader ready, sending " + cmd)
+    command = str.encode(cmd)
+    self.dev.write(command)
+    self.dev.flushInput()
+```
+
+<Steps>
+  <Step title="Wait for Preloader">
+    Script polls the serial port, waiting for the preloader to send `Y` (0x59).
+    
+    The preloader sends this byte when ready to receive commands.
+  </Step>
+
+  <Step title="Send Boot Command">
+    Once `Y` is received, the script sends the 8-byte ASCII command:
+    - `FACTFACT` (0x46 0x41 0x43 0x54 0x46 0x41 0x43 0x54) for fastboot
+    - `FACTORYM` (0x46 0x41 0x43 0x54 0x4F 0x52 0x59 0x4D) for recovery
+  </Step>
+
+  <Step title="Preloader Processing">
+    Preloader receives the command and:
+    1. Validates command format
+    2. Writes appropriate boot flag to MISC partition
+    3. Initiates device reboot
+  </Step>
+
+  <Step title="Device Reboot">
+    Device reboots and the bootloader reads MISC partition:
+    - If `FACTFACT` detected → boot to fastboot
+    - If `FACTORYM` detected → boot to recovery
+    - Otherwise → normal boot
+  </Step>
+</Steps>
+
+## Boot Flag Mechanisms
+
+### MISC Partition Structure
+
+The MISC partition stores boot flags in its first 32 bytes:
+
+| Offset | Size | Purpose | Fastboot Value | Recovery Value |
+|--------|------|---------|----------------|----------------|
+| 0x00 | 16 | Boot command | `FASTBOOT_PLEASE\x00` | `boot-recovery\x00\x00\x00` |
+| 0x10 | 16 | Recovery message | (unused) | (varies) |
+
+### Setting Flags Programmatically
+
+You can also set these flags directly using Python (requires bootrom exploit first):
+
+```python Force Fastboot
+from functions import force_fastboot
+
+force_fastboot(dev, gpt)
+```
+
+```python Force Recovery
+from functions import force_recovery
+
+force_recovery(dev, gpt)
+```
+
+```python Temporary Fastboot
+from functions import temp_fastboot
+
+temp_fastboot(dev, gpt)  # writes "boot-amonet"
+```
+
+```python Clear Boot Flags
+from functions import clear_flags
+
+clear_flags(dev, gpt)  # zeroes first 32 bytes
+```
+
+### Function Implementations
+
+From modules/functions.py:
+
+```python
+def force_fastboot(dev, gpt):
+    switch_user(dev)
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:16] = "FASTBOOT_PLEASE\x00".encode("utf-8")
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+    block = dev.emmc_read(gpt["MISC"][0])
+
+def force_recovery(dev, gpt):
+    switch_user(dev)
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:16] = "boot-recovery\x00\x00\x00".encode("utf-8")
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+    block = dev.emmc_read(gpt["MISC"][0])
+
+def temp_fastboot(dev, gpt):
+    switch_user(dev)
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:16] = "boot-amonet\x00\x00\x00\x00\x00".encode("utf-8")
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+    block = dev.emmc_read(gpt["MISC"][0])
+
+def clear_flags(dev, gpt):
+    switch_user(dev)
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:32] = b"\x00" * 32
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+    block = dev.emmc_read(gpt["MISC"][0])
+```
+
+## Advanced Usage
+
+### Custom Boot Commands
+
+You can send custom commands to the preloader:
+
+```bash
+cd modules
+python3 handshake2.py YOUR_CMD
+```
+
+Replace `YOUR_CMD` with any 8-byte ASCII string. The preloader may recognize:
+- `FACTFACT` - Fastboot mode
+- `FACTORYM` - Recovery mode
+- Other commands may be device/firmware specific
+
+### Specifying Serial Port
+
+If you have multiple devices or want to use a specific port:
+
+```bash
+cd modules
+python3 handshake2.py FACTFACT /dev/ttyUSB1
+```
+
+This bypasses automatic device detection.
+
+### Scripting Boot Sequences
+
+Example: Boot to fastboot, flash, reboot to recovery
+
+```bash
+#!/bin/bash
+
+# Boot to fastboot
+./boot-fastboot.sh
+sleep 5
+
+# Flash images
+fastboot flash boot boot.img
+fastboot flash system system.img
+
+# Reboot to recovery
+fastboot reboot
+sleep 10
+./boot-recovery.sh
+```
+
+## Troubleshooting
+
+### Device Not Responding
+
+**Problem**: Script hangs at "Waiting for device"
+
+**Solutions**:
+- Ensure device is powered on
+- Device must be in preloader mode (not bootrom)
+- Check USB connection
+- Verify serial port permissions:
+  ```bash
+  sudo usermod -a -G dialout $USER
+  # Log out and back in
+  ```
+
+### Wrong Boot Mode
+
+**Problem**: Device boots to normal system instead of fastboot/recovery
+
+**Causes**:
+- MISC partition write failed
+- Bootloader doesn't recognize boot flag
+- Custom ROM overriding boot flags
+
+**Solutions**:
+```bash
+# Verify MISC partition is writable
+./bootrom-step.sh
+# Then manually write boot flag using Python functions
+```
+
+### Preloader Not Sending 'Y'
+
+**Problem**: Device connects but never sends start byte
+
+**Solutions**:
+- Device may be in bootrom mode instead of preloader
+  - Run `./bootrom-step.sh` first
+  - Or use hardware buttons to enter preloader mode
+- Wrong baud rate or serial settings
+  - Check common.py for BAUD = 115200
+- USB cable quality issue
+  - Try different cable or USB port
+
+### Permission Denied on Serial Port
+
+**Problem**: "Permission denied: '/dev/ttyUSB0'"
+
+**Solutions**:
+```bash
+# Temporary fix
+sudo chmod 666 /dev/ttyUSB0
+
+# Permanent fix
+sudo usermod -a -G dialout $USER
+sudo usermod -a -G uucp $USER
+# Log out and log back in
+```
+
+### Boot Loop
+
+**Problem**: Device continuously reboots to fastboot/recovery
+
+**Solutions**:
+```bash
+# Clear boot flags
+cd modules
+python3 << EOF
+from common import Device
+from functions import clear_flags, parse_gpt, switch_user
+
+dev = Device()
+dev.find_device()
+switch_user(dev)
+gpt = parse_gpt(dev)
+clear_flags(dev, gpt)
+dev.reboot()
+EOF
+```
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/usage/quickstart">
+    Initial exploit and first boot
+  </Card>
+  <Card title="Bootrom Exploit" icon="shield-halved" href="/usage/bootrom-exploit">
+    Gain initial access before using boot scripts
+  </Card>
+  <Card title="GPT Operations" icon="hard-drive" href="/usage/gpt-operations">
+    MISC partition structure details
+  </Card>
+  <Card title="Functions Module" icon="code" href="/reference/functions">
+    Python API for boot flag manipulation
+  </Card>
+</CardGroup>
+
+## Safety Notes
+
+<Warning>
+  Boot mode scripts are safe to use repeatedly, but ensure:
+  - Device has sufficient battery (>30%)
+  - You understand which mode you're booting into
+  - You have a way to recover if device gets stuck
+</Warning>
+
+<Note>
+  These scripts require the device to be in preloader mode. If starting from a powered-off state, run `bootrom-step.sh` first to install the exploited preloader.
+</Note>
